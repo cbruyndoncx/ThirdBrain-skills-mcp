@@ -12,7 +12,8 @@
     "test:gbl": "tsx test/smoke.ts /mnt/d/OBS/gbl-skills/00-CORE/Agents/skills gbl 'prepare VAT return' vat-return-preparer vat-return-preparer references/reference.md",
     "test:nested": "node test/nested.mjs test/fixtures/nested",
     "test:unit": "tsx --test test/unit/*.test.ts",
-    "test:all": "npm run test:unit && npm run test:nested && npm test"
+    "test:all": "npm run test:unit && npm run test:nested && npm test",
+    "prepare": "npm run build"
   },
   "keywords": [
     "mcp",
