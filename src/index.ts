@@ -31,14 +31,17 @@ async function main() {
   };
   const cat = new Catalog(cfg);
   const t0 = Date.now();
-  await cat.scan();
-  const st = cat.getStats();
-  log(`libraries=${cfg.libraries.map((l) => `${l.namespace || "(root)"}:${l.root}${l.noScripts || cfg.noScripts ? "(no-scripts)" : ""}`).join(",")} lint=${cfg.lint} flagged=${st.flaggedSkills} withheld=${st.scriptsWithheld} skills=${st.skills} hidden=${st.hidden} files=${st.files} bytes=${(st.bytes / 1048576).toFixed(1)}MiB scan=${Date.now() - t0}ms warnings=${st.warnings.length}`);
+  // Start scanning now but do not block the transport: initialize answers immediately and
+  // the first request waits for the catalog (large libraries on slow disks take 10-30 s).
+  const initial = cat.scan();
+  initial.then(() => { const st = cat.getStats(); log(`libraries=${cfg.libraries.map((l) => `${l.namespace || "(root)"}:${l.root}${l.noScripts || cfg.noScripts ? "(no-scripts)" : ""}`).join(",")} lint=${cfg.lint} flagged=${st.flaggedSkills} withheld=${st.scriptsWithheld} skills=${st.skills} hidden=${st.hidden} files=${st.files} bytes=${(st.bytes / 1048576).toFixed(1)}MiB scan=${Date.now() - t0}ms warnings=${st.warnings.length}`); });
 
   if (cfg.statsOnly) {
-    process.stdout.write(JSON.stringify(st, null, 2) + "\n");
+    await initial;
+    process.stdout.write(JSON.stringify(cat.getStats(), null, 2) + "\n");
     return;
   }
+  initial.catch((e) => { log("fatal: initial scan failed:", e?.message ?? e); process.exit(1); });
 
   if (cfg.rescanSeconds > 0) {
     const timer = setInterval(() => reload("interval").catch((e) => log("rescan failed:", e.message)), cfg.rescanSeconds * 1000);

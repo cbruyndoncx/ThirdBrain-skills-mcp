@@ -93,7 +93,7 @@ export class Catalog {
     return () => this.listeners.delete(fn);
   }
 
-  getStats(): CatalogStats { return this.stats; }
+  getStats(): CatalogStats { return this.stats ?? { root: this.cfg.root, libraries: [], flaggedSkills: 0, scriptsWithheld: 0, skills: 0, hidden: 0, files: 0, bytes: 0, categories: {}, warnings: [], scannedAt: "", scanMs: 0 }; }
   all(library?: string): Skill[] {
     const v = [...this.skills.values()].filter((s) => library === undefined || s.library === library);
     return v.sort((a, b) => a.skillPath.localeCompare(b.skillPath));
@@ -140,10 +140,15 @@ export class Catalog {
     return f.digest;
   }
 
+  private firstScan: Promise<void> | null = null;
+  /** Resolves once the initial scan has completed (or immediately afterwards). Request handlers await this. */
+  ready(): Promise<void> { return this.firstScan ?? this.scan(); }
+
   /** Full rescan. Concurrent callers share one scan. */
   scan(): Promise<void> {
     if (this.scanning) return this.scanning;
     this.scanning = this.doScan().finally(() => { this.scanning = null; });
+    this.firstScan ??= this.scanning;
     return this.scanning;
   }
 

@@ -98,7 +98,7 @@ async function readContent(f: SkillFile, uri: string) {
 
 export function instructionsFor(cfg: Config, count: number): string {
   const p = cfg.toolPrefix;
-  return `${cfg.title}: ${count} Agent Skills (SKILL.md folders) served over MCP.
+  return `${cfg.title}: ${count > 0 ? `${count} ` : ""}Agent Skills (SKILL.md folders) served over MCP.
 Skills are loaded on demand (progressive disclosure), never all at once.
 
 Workflow:
@@ -141,32 +141,32 @@ export function createServer(cfg: Config, cat: Catalog): Server {
   };
 
   // ---- SEP-2640: skills/list, skills/get ----
-  server.setRequestHandler(SkillsListRequestSchema, async (req) => {
+  server.setRequestHandler(SkillsListRequestSchema, async (req) => { await cat.ready();
     const { items, nextCursor } = page(cat.all(), req.params?.cursor, 50);
     const skills = await Promise.all(items.map((s) => skillEntry(cat, s)));
     return { resultType: "complete", skills, ...(nextCursor ? { nextCursor } : {}) } as any;
   });
 
-  server.setRequestHandler(SkillsGetRequestSchema, async (req) => {
+  server.setRequestHandler(SkillsGetRequestSchema, async (req) => { await cat.ready();
     const r = cat.resolveUri(req.params.uri);
     if (!r || (r.rel && r.rel !== "SKILL.md")) throw new McpError(ErrorCode.InvalidParams, `Not a skill URI: ${req.params.uri}`);
     return skillEntry(cat, r.skill) as any;
   });
 
   // ---- Resources ----
-  server.setRequestHandler(ListResourcesRequestSchema, async (req) => {
+  server.setRequestHandler(ListResourcesRequestSchema, async (req) => { await cat.ready();
     const { items, nextCursor } = page(cat.all(), req.params?.cursor);
     return { resources: items.map(skillResource), nextCursor };
   });
 
-  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => (await cat.ready(), {
     resourceTemplates: [
       { uriTemplate: "skill://{+skillPath}/SKILL.md", name: "skill", title: "Skill instructions", description: "SKILL.md of a skill by path", mimeType: "text/markdown" },
       { uriTemplate: "skill://{+skillPath}/{+path}", name: "skill-file", title: "Skill bundled file", description: "Any file bundled with a skill (references/, scripts/, templates/, assets/)" },
     ],
   }));
 
-  server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
+  server.setRequestHandler(ReadResourceRequestSchema, async (req) => { await cat.ready();
     const r = cat.resolveUri(req.params.uri);
     if (!r) throw new McpError(ErrorCode.InvalidParams, `Unknown resource: ${req.params.uri}`);
     if (!r.rel) { // bare skill:// dir → SKILL.md
@@ -197,7 +197,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  server.setRequestHandler(DirectoryReadRequestSchema, async (req) => {
+  server.setRequestHandler(DirectoryReadRequestSchema, async (req) => { await cat.ready();
     const r = cat.resolveUri(req.params.uri);
     if (!r) throw new McpError(ErrorCode.InvalidParams, `Unknown directory: ${req.params.uri}`);
     if (r.file) throw new McpError(ErrorCode.InvalidParams, `Not a directory: ${req.params.uri}`);
@@ -362,7 +362,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
   ];
   };
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: buildTools() }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => { await cat.ready(); return { tools: buildTools() }; });
 
   /** Structured + text result. Text carries a human rendering (or the JSON) so hosts without structuredContent support still work. */
   const structured = (data: Record<string, unknown>, text?: string) => ({
@@ -376,7 +376,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     return l;
   };
 
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  server.setRequestHandler(CallToolRequestSchema, async (req) => { await cat.ready();
     const a = (req.params.arguments ?? {}) as Record<string, any>;
     try {
       switch (req.params.name) {
@@ -451,7 +451,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
   });
 
   // ---- Prompts: lets hosts expose "/<server>:use-skill <name>" ----
-  server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+  server.setRequestHandler(ListPromptsRequestSchema, async () => (await cat.ready(), {
     prompts: [{
       name: "use-skill",
       title: `Use a ${cfg.serverName} skill`,
@@ -463,7 +463,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     }],
   }));
 
-  server.setRequestHandler(GetPromptRequestSchema, async (req) => {
+  server.setRequestHandler(GetPromptRequestSchema, async (req) => { await cat.ready();
     if (req.params.name !== "use-skill") throw new McpError(ErrorCode.InvalidParams, `Unknown prompt ${req.params.name}`);
     const s = requireSkill(String(req.params.arguments?.skill ?? ""));
     const task = req.params.arguments?.task;
