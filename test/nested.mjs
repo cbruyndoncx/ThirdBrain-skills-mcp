@@ -1,0 +1,13 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { z } from "zod";
+const c = new Client({ name: "p", version: "0" });
+await c.connect(new StdioClientTransport({ command: "node", args: ["dist/index.js", "--root", process.argv[2], "--name", "demo"], stderr: "pipe" }));
+const l = await c.request({ method: "skills/list", params: {} }, z.any());
+console.log(l.skills.map(s => s.uri));
+const r = await c.readResource({ uri: "skill://acme/billing/refunds/examples/email.md" });
+console.log("nested file:", r.contents[0].text.trim());
+const g = await c.callTool({ name: "demo_get_skill", arguments: { name: "acme/billing/refunds" } }); console.log("by path ok:", !g.isError);
+const a = await c.callTool({ name: "demo_get_skill", arguments: { name: "refunds" } }); console.log("ambiguous bare name isError:", a.isError);
+const s = await c.callTool({ name: "demo_get_skill", arguments: { name: "solo" } }); console.log("bare unique name ok:", !s.isError);
+await c.close();

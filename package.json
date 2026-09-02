@@ -1,0 +1,52 @@
+{
+  "name": "thirdbrain-skills-mcp",
+  "version": "1.2.0",
+  "description": "MCP server that serves the ThirdBrain BOB skill library over MCP (SEP-2640 skills extension + discovery tools)",
+  "main": "index.js",
+  "scripts": {
+    "test": "tsx test/smoke.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "inspect": "tsx src/index.ts --stats",
+    "test:gbl": "tsx test/smoke.ts /mnt/d/OBS/gbl-skills/00-CORE/Agents/skills gbl 'prepare VAT return' vat-return-preparer vat-return-preparer references/reference.md",
+    "test:nested": "node test/nested.mjs test/fixtures/nested",
+    "test:unit": "tsx --test test/unit/*.test.ts",
+    "test:all": "npm run test:unit && npm run test:nested && npm test"
+  },
+  "keywords": [
+    "mcp",
+    "agent-skills",
+    "sep-2640",
+    "skills",
+    "model-context-protocol"
+  ],
+  "author": "Carine Bruyndoncx",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  },
+  "bin": {
+    "skills-mcp": "dist/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cbruyndoncx/ThirdBrain-skills-mcp.git"
+  },
+  "homepage": "https://github.com/cbruyndoncx/ThirdBrain-skills-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/cbruyndoncx/ThirdBrain-skills-mcp/issues"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ]
+}
