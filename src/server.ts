@@ -159,7 +159,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     return { resources: items.map(skillResource), nextCursor };
   });
 
-  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => (await cat.ready(), {
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
     resourceTemplates: [
       { uriTemplate: "skill://{+skillPath}/SKILL.md", name: "skill", title: "Skill instructions", description: "SKILL.md of a skill by path", mimeType: "text/markdown" },
       { uriTemplate: "skill://{+skillPath}/{+path}", name: "skill-file", title: "Skill bundled file", description: "Any file bundled with a skill (references/, scripts/, templates/, assets/)" },
@@ -362,7 +362,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
   ];
   };
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => { await cat.ready(); return { tools: buildTools() }; });
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: buildTools() })); // static: never waits for the scan
 
   /** Structured + text result. Text carries a human rendering (or the JSON) so hosts without structuredContent support still work. */
   const structured = (data: Record<string, unknown>, text?: string) => ({
@@ -451,7 +451,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
   });
 
   // ---- Prompts: lets hosts expose "/<server>:use-skill <name>" ----
-  server.setRequestHandler(ListPromptsRequestSchema, async () => (await cat.ready(), {
+  server.setRequestHandler(ListPromptsRequestSchema, async () => ({
     prompts: [{
       name: "use-skill",
       title: `Use a ${cfg.serverName} skill`,
