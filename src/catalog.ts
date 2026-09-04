@@ -71,6 +71,14 @@ const MIME: Record<string, string> = {
   ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 };
 
+/** Category derived from the path between the library namespace and the skill directory, if any. */
+export function parentCategory(skillPath: string, library: string): string {
+  const segs = skillPath.split("/");
+  if (library) segs.shift();
+  segs.pop();
+  return segs.join("/");
+}
+
 export function mimeFor(file: string): string {
   return MIME[path.extname(file).toLowerCase()] ?? "application/octet-stream";
 }
@@ -286,7 +294,8 @@ export class Catalog {
       name, dir, library, skillPath, abs,
       uri: `skill://${skillPath.split("/").map(encodeURIComponent).join("/")}/SKILL.md`,
       description,
-      category: coerceString(fm.category) || "uncategorized",
+      // Nested libraries often encode the category in the folder path (e.g. sales/create-a-sales-asset).
+      category: coerceString(fm.category) || parentCategory(skillPath, library) || "uncategorized",
       version: coerceString(fm.version) || "1.0.0",
       tags: [...new Set([...coerceList(fm.tags), ...coerceList(fm["dev-tags"]), ...coerceList(fm["trigger-phrases"])])],
       valueChains: coerceList(fm["value-chains"]),

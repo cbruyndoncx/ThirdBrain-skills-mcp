@@ -25,8 +25,12 @@ test("multi-library: namespaced paths, bare-name ambiguity, lib/name lookup", as
   const st = cat.getStats();
   assert.deepEqual(st.libraries.map((l) => [l.namespace, l.skills, l.hidden]), [["a", 2, 0], ["b", 2, 1]]);
 });
-test("nested library: deep paths and duplicate leaf names", async () => {
+test("nested library: deep paths and duplicate leaf names; folder path becomes category", async () => {
   const { cat } = await catalogFor(["--root", nested]);
+  assert.equal(cat.get("acme/billing/refunds")!.category, "acme/billing");
+  assert.equal(cat.get("solo")!.category, "uncategorized");
+  const ns = await catalogFor(["--lib", `n=${nested}`]);
+  assert.equal(ns.cat.get("n/acme/billing/refunds")!.category, "acme/billing", "namespace is not part of the category");
   assert.deepEqual(cat.all().map((s) => s.skillPath), ["acme/billing/refunds", "acme/other/refunds", "solo"]);
   assert.equal(cat.get("refunds"), undefined);
   assert.ok(cat.get("acme/billing/refunds"));
