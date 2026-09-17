@@ -1,11 +1,17 @@
 import path from "node:path";
 import fs from "node:fs";
+import { isArchiveRoot, defaultCacheRoot, DEFAULT_LIMITS, type ExtractLimits } from "./archive.js";
 
 export interface Library {
   /** Namespace used as the first URI segment (skill://<ns>/<skill>/...). Empty string = un-namespaced single library. */
   namespace: string;
-  /** Absolute path to the directory that contains skill directories (searched recursively). */
+  /**
+   * Absolute path to the library. Either a directory containing skill directories (searched
+   * recursively), or a `.zip` archive of one, which is extracted before discovery.
+   */
   root: string;
+  /** True when `root` is a `.zip` to be extracted rather than a directory. */
+  archive?: boolean;
   /** Withhold executable files (scripts) from this library's manifests. */
   noScripts?: boolean;
 }
@@ -50,6 +56,10 @@ export interface Config {
   maxDiscoveryDepth: number;
   /** Seconds between automatic catalog rescans (0 disables). */
   rescanSeconds: number;
+  /** Where archive libraries are extracted, keyed by content digest. */
+  cacheDir: string;
+  /** Extraction ceilings for archive libraries. */
+  archiveLimits: ExtractLimits;
   http?: { port: number; host: string };
   statsOnly: boolean;
 }
@@ -62,8 +72,10 @@ usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefi
   --config FILE      JSON {libraries:[{namespace,root,noScripts?}],noScripts?,lint?}; re-read on rescan/SIGHUP   env SKILLS_CONFIG
   --no-scripts       withhold executable files (.sh .py .js .ps1 ...) from all manifests      env SKILLS_NO_SCRIPTS=true
   --no-lint          disable the scan-time risk linter                                        env SKILLS_LINT=false
-  --root DIR         single un-namespaced library (skill://<skill>/...)          env SKILLS_ROOT
-  --lib NS=DIR       add a namespaced library (skill://NS/<skill>/...); repeatable env SKILLS_LIBS="bob=/a,gbl=/b"
+  --root DIR|ZIP     single un-namespaced library (skill://<skill>/...)          env SKILLS_ROOT
+  --lib NS=DIR|ZIP   add a namespaced library (skill://NS/<skill>/...); repeatable env SKILLS_LIBS="bob=/a,gbl=/b.zip"
+                     A .zip root is extracted to the cache dir before discovery; archives are
+                     never allowed *inside* a library.
   --name NAME        MCP server name, default "skills"                           env SKILLS_NAME
   --prefix PREFIX    tool-name prefix, default = --name with '-' -> '_'          env SKILLS_TOOL_PREFIX
   --title TITLE      human title, default derived from name                     env SKILLS_TITLE
@@ -73,6 +85,8 @@ usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefi
   --http PORT        Streamable HTTP on PORT instead of stdio                    env SKILLS_HOST (bind address)
   --stats            print catalog statistics as JSON and exit
   env SKILLS_MAX_FILE_BYTES (default 4 MiB), SKILLS_RESCAN_SECONDS (default 60)
+  env SKILLS_CACHE_DIR (default ~/.cache/skills-mcp), SKILLS_MAX_ARCHIVE_BYTES (default 256 MiB),
+      SKILLS_MAX_ARCHIVE_ENTRIES (default 8192)
 `;
 
 export function validateLibraries(libs: Library[]): void {
@@ -80,6 +94,7 @@ export function validateLibraries(libs: Library[]): void {
   for (const l of libs) {
     if (typeof l.root !== "string" || !l.root) throw new Error(`library '${l.namespace}' has no root`);
     l.root = path.resolve(l.root);
+    l.archive = isArchiveRoot(l.root);
     if (l.namespace && !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(l.namespace)) throw new Error(`library namespace '${l.namespace}' must match [a-zA-Z0-9][a-zA-Z0-9_.-]*`);
     if (seen.has(l.namespace)) throw new Error(`duplicate library namespace '${l.namespace || "(root)"}'`);
     seen.add(l.namespace);
@@ -193,6 +208,13 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     maxFilesPerSkill: 512,
     maxDiscoveryDepth: Number.isFinite(depth) && depth > 0 ? depth : 4,
     rescanSeconds: Number(env("RESCAN_SECONDS") ?? 60),
+    cacheDir: env("CACHE_DIR") ? path.resolve(env("CACHE_DIR")!) : defaultCacheRoot(),
+    archiveLimits: {
+      ...DEFAULT_LIMITS,
+      maxTotalBytes: Number(env("MAX_ARCHIVE_BYTES") ?? DEFAULT_LIMITS.maxTotalBytes),
+      maxEntries: Number(env("MAX_ARCHIVE_ENTRIES") ?? DEFAULT_LIMITS.maxEntries),
+      maxEntryBytes: Number(env("MAX_FILE_BYTES") ?? 4 * 1024 * 1024) * 16,
+    },
     http,
     statsOnly,
   };

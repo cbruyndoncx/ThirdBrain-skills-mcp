@@ -6,6 +6,7 @@ import type { Config, Library } from "./config.js";
 interface Discovered { skillPath: string; abs: string; library: string }
 import { splitFrontmatter, coerceString, coerceList } from "./frontmatter.js";
 import { lintFiles, SCRIPT_EXTENSIONS, type LintFinding } from "./lint.js";
+import { extractLibrary, pruneCache, isArchivePath } from "./archive.js";
 
 export interface SkillFile {
   /** Path relative to the skill directory, always with forward slashes. */
@@ -49,6 +50,8 @@ export interface CatalogStats {
   libraries: { namespace: string; root: string; skills: number; hidden: number; noScripts: boolean }[];
   flaggedSkills: number;
   scriptsWithheld: number;
+  /** Skills not served because they bundle an archive file. */
+  archiveSkillsRejected: number;
   skills: number;
   hidden: number;
   files: number;
@@ -93,6 +96,9 @@ export class Catalog {
   private stats!: CatalogStats;
   private scanning: Promise<void> | null = null;
   private listeners = new Set<() => void>();
+  /** Per-archive memo so an unchanged zip is not re-hashed or re-extracted on every rescan. */
+  private archiveState = new Map<string, { mtimeMs: number; size: number; dir: string; digest: string }>();
+  private archiveRejected = 0;
 
   constructor(private cfg: Config) {}
 
@@ -101,7 +107,7 @@ export class Catalog {
     return () => this.listeners.delete(fn);
   }
 
-  getStats(): CatalogStats { return this.stats ?? { root: this.cfg.root, libraries: [], flaggedSkills: 0, scriptsWithheld: 0, skills: 0, hidden: 0, files: 0, bytes: 0, categories: {}, warnings: [], scannedAt: "", scanMs: 0 }; }
+  getStats(): CatalogStats { return this.stats ?? { root: this.cfg.root, libraries: [], flaggedSkills: 0, scriptsWithheld: 0, archiveSkillsRejected: 0, skills: 0, hidden: 0, files: 0, bytes: 0, categories: {}, warnings: [], scannedAt: "", scanMs: 0 }; }
   all(library?: string): Skill[] {
     const v = [...this.skills.values()].filter((s) => library === undefined || s.library === library);
     return v.sort((a, b) => a.skillPath.localeCompare(b.skillPath));
@@ -163,6 +169,7 @@ export class Catalog {
   private async doScan(): Promise<void> {
     const t0 = Date.now();
     const warnings: string[] = [];
+    this.archiveRejected = 0;
     const next = new Map<string, Skill>();
     const nextHidden = new Map<string, Skill>();
     const dirs: Discovered[] = [];
@@ -172,7 +179,23 @@ export class Catalog {
         warnings.push(`library '${lib.namespace}': cannot read ${lib.root}: ${(e as Error).message}`);
         continue;
       }
-      await this.discover(lib, lib.root, lib.namespace, 0, dirs);
+      let effectiveRoot = lib.root;
+      if (lib.archive) {
+        try {
+          effectiveRoot = await this.resolveArchive(lib);
+        } catch (e) {
+          const msg = `archive library ${lib.root}: ${(e as Error).message}`;
+          if (this.cfg.libraries.length === 1) throw new Error(msg);
+          warnings.push(`library '${lib.namespace || "(root)"}': ${msg}`);
+          continue;
+        }
+      }
+      await this.discover(lib, effectiveRoot, lib.namespace, 0, dirs);
+    }
+    if (this.cfg.libraries.some((l) => l.archive)) {
+      // Drop extractions for archives that are no longer referenced or have been replaced.
+      const keep = new Set([...this.archiveState.values()].map((v) => v.digest));
+      await pruneCache(this.cfg.cacheDir, keep).catch(() => 0);
     }
     const oldAll = new Map([...this.skills, ...this.hidden]);
 
@@ -210,7 +233,7 @@ export class Catalog {
     }
     for (const s of nextHidden.values()) perLib.get(s.library)!.hidden++;
     this.stats = {
-      root: this.cfg.root, libraries: [...perLib.values()], flaggedSkills, scriptsWithheld, skills: next.size, hidden: nextHidden.size, files, bytes, categories, warnings,
+      root: this.cfg.root, libraries: [...perLib.values()], flaggedSkills, scriptsWithheld, archiveSkillsRejected: this.archiveRejected, skills: next.size, hidden: nextHidden.size, files, bytes, categories, warnings,
       scannedAt: new Date().toISOString(), scanMs: Date.now() - t0,
     };
     if (changed) for (const fn of this.listeners) fn();
@@ -223,6 +246,22 @@ export class Catalog {
       if (!w || w.skillMdMtimeMs !== v.skillMdMtimeMs || w.files.length !== v.files.length || w.totalBytes !== v.totalBytes) return true;
     }
     return false;
+  }
+
+  /**
+   * Resolve an archive library to the directory it extracts to. The archive is re-extracted only
+   * when its mtime/size changed, so the usual rescan costs a single stat rather than a re-hash of
+   * a large zip.
+   */
+  private async resolveArchive(lib: Library): Promise<string> {
+    const st = await fs.stat(lib.root);
+    const prev = this.archiveState.get(lib.root);
+    if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
+      try { await fs.access(prev.dir); return prev.dir; } catch { /* cache was cleared; re-extract */ }
+    }
+    const r = await extractLibrary(lib.root, this.cfg.cacheDir, this.cfg.archiveLimits);
+    this.archiveState.set(lib.root, { mtimeMs: st.mtimeMs, size: st.size, dir: r.dir, digest: r.digest });
+    return r.dir;
   }
 
   /** Find directories containing SKILL.md, up to maxDiscoveryDepth. A skill directory is not descended into. */
@@ -246,7 +285,14 @@ export class Catalog {
 
     const lib = this.cfg.libraries.find((l) => l.namespace === library);
     const noScripts = !!(this.cfg.noScripts || lib?.noScripts);
-    let files = await this.walk(abs, abs, warnings);
+    const archives: string[] = [];
+    let files = await this.walk(abs, abs, warnings, [], archives);
+    if (archives.length) {
+      const shown = archives.slice(0, 3).join(", ") + (archives.length > 3 ? `, +${archives.length - 3} more` : "");
+      warnings.push(`${skillPath}: bundles archive file(s) (${shown}); skills may not contain archives, skill not served`);
+      this.archiveRejected++;
+      return null;
+    }
     let scriptsWithheld = 0;
     if (noScripts) {
       const kept = files.filter((f) => f.rel === "SKILL.md" || !SCRIPT_EXTENSIONS.test(f.rel));
@@ -312,16 +358,19 @@ export class Catalog {
     };
   }
 
-  private async walk(base: string, dir: string, warnings: string[], out: SkillFile[] = []): Promise<SkillFile[]> {
+  private async walk(base: string, dir: string, warnings: string[], out: SkillFile[] = [], archives: string[] = []): Promise<SkillFile[]> {
     let entries: import("node:fs").Dirent[];
     try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return out; }
     for (const e of entries) {
       const abs = path.join(dir, e.name);
       if (e.isDirectory()) {
         if (this.cfg.ignoreDirs.has(e.name) || e.name.startsWith(".") || e.name.endsWith(".dist-info") || e.name.endsWith(".egg-info")) continue;
-        await this.walk(base, abs, warnings, out);
+        await this.walk(base, abs, warnings, out, archives);
       } else if (e.isFile()) {
         const ext = path.extname(e.name).toLowerCase();
+        // A library may *be* an archive, but nothing inside one may be: archives hide their
+        // contents from the linter, so a bundled zip would be served unscanned.
+        if (isArchivePath(e.name)) { archives.push(path.relative(base, abs).split(path.sep).join("/")); continue; }
         if (this.cfg.ignoreExts.has(ext) || e.name.startsWith(".")) continue;
         let st;
         try { st = await fs.stat(abs); } catch { continue; }

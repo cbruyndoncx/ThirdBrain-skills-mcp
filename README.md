@@ -85,8 +85,8 @@ the namespace as a folder; `--force` overwrites; `--dry-run` verifies without wr
 
 | Flag / env | Default | Meaning |
 |---|---|---|
-| `--root` / `SKILLS_ROOT` | one of these required | Single un-namespaced library, searched recursively for `SKILL.md` folders. |
-| `--lib NS=DIR` / `SKILLS_LIBS="a=/x,b=/y"` | | Namespaced library; repeatable. Cannot be mixed with `--root`. |
+| `--root` / `SKILLS_ROOT` | one of these required | Single un-namespaced library: a directory searched recursively for `SKILL.md` folders, or a `.zip` of one. |
+| `--lib NS=DIR` / `SKILLS_LIBS="a=/x,b=/y.zip"` | | Namespaced library; repeatable. Cannot be mixed with `--root`. A `.zip` root is allowed. |
 | `--name` / `SKILLS_NAME` | `skills` | MCP server name; also the default tool prefix. |
 | `--prefix` / `SKILLS_TOOL_PREFIX` | name with `-`→`_` | Tool-name prefix. |
 | `--title` / `SKILLS_TITLE` | derived | Human title in `initialize`. |
@@ -94,6 +94,9 @@ the namespace as a folder; `--force` overwrites; `--dry-run` verifies without wr
 | `--depth` / `SKILLS_DEPTH` | `4` | Max discovery depth below root. |
 | `--show-disabled` / `SKILLS_HIDE_DISABLED=false` | hidden | Serve skills with `disable-model-invocation: true`. |
 | `SKILLS_MAX_FILE_BYTES` | 4 MiB | Files above this are not served. |
+| `SKILLS_CACHE_DIR` | `~/.cache/skills-mcp` | Where `.zip` libraries are extracted, keyed by content digest. |
+| `SKILLS_MAX_ARCHIVE_BYTES` | 256 MiB | Total uncompressed size an archive library may extract to. |
+| `SKILLS_MAX_ARCHIVE_ENTRIES` | `8192` | Max entries in an archive library. |
 | `SKILLS_RESCAN_SECONDS` | `60` | Background rescan interval (`0` disables). `<prefix>_catalog_status refresh=true` forces one. |
 | `--stats` | | Print catalog statistics as JSON and exit. |
 
@@ -105,6 +108,53 @@ Tools accept the bare `name` (when unique across all libraries), `<namespace>/<n
 
 Always ignored inside skills: `.venv`, `node_modules`, `__pycache__`, `*.dist-info`, `.git`,
 dotfiles, and compiled artefacts (`.pyc`, `.so`, `.whl`, ...).
+
+## Archive libraries
+
+A library root may be a `.zip` instead of a directory:
+
+```bash
+skills-mcp --lib bob=/srv/libraries/bob-skills.zip
+skills-mcp --root ./my-skills.zip
+```
+
+The archive is a transport container, not served content. On the first scan it is extracted into
+`SKILLS_CACHE_DIR/<sha256-of-zip>/`, and discovery, linting, digests and URIs then run over ordinary
+files — nothing downstream knows an archive was involved. Because the cache is keyed by content
+digest, a rescan of an unchanged archive costs a single `stat`; replacing the archive extracts the
+new one and prunes the extraction it replaced.
+
+Skills inside the archive are laid out exactly as in a directory library, so a wrapper directory
+(as produced by `git archive` or GitHub's "Download ZIP") is fine — discovery descends into it.
+
+**Archives may not appear inside a library.** A bundled `payload.zip` would be served as an opaque
+base64 blob that the risk linter cannot read, so any skill containing one is refused and reported:
+
+```
+sneaky: bundles archive file(s) (notes.tgz, payload.zip); skills may not contain archives, skill not served
+```
+
+This applies to directory libraries too, and covers `.zip .tar .tgz .tar.gz .gz .bz2 .xz .7z .rar
+.jar .war .apk .iso .dmg .cab` — renaming a zip to `.tgz` does not get past it. The count appears in
+`--stats` as `archiveSkillsRejected`. One bad skill is withheld; the rest of the library still serves.
+
+### What is rejected in an archive
+
+The archive is treated as untrusted input. Extraction refuses, before writing anything to disk:
+
+| Check | Why |
+|---|---|
+| Entry paths containing `..`, absolute paths, drive letters, backslashes | Path traversal ("zip slip") |
+| Symlink entries | A link to `~/.ssh/id_rsa` would otherwise be served verbatim |
+| Encrypted entries, compression methods other than stored/deflate, zip64 | Unparseable or unsupported |
+| Nested archives | Hide content from the linter |
+| More than `SKILLS_MAX_ARCHIVE_ENTRIES` entries | Resource exhaustion |
+| Entries over `SKILLS_MAX_FILE_BYTES × 16`, or a total over `SKILLS_MAX_ARCHIVE_BYTES` | Decompression bombs |
+| Compression ratio over 100:1 *for entries above 1 MiB* | Bombs, without flagging ordinary repetitive content |
+
+The byte budget is enforced **while inflating**, not from the sizes declared in the central
+directory, since those are attacker-controlled and may lie. A failed extraction leaves no partial
+tree behind, and extracted files are always written non-executable (`0644`).
 
 ## Runtime config file and hardening
 
@@ -153,12 +203,13 @@ before a host runs them. Rules live in `src/lint.ts`.
 src/config.ts       env/CLI configuration
 src/frontmatter.ts  SKILL.md frontmatter parsing
 src/catalog.ts      directory scan, file inventory, digests, change detection
+src/archive.ts      zip-backed libraries: strict extraction, path/bomb/symlink defences, digest cache
 src/search.ts       ranked keyword search over name/description/tags/body
 src/server.ts       MCP wiring: extension methods, resources, tools, prompt
 src/lint.ts         scan-time risk linter (labels, never blocks)
 src/pull.ts         client: sync skills from a SEP-2640 server with digest verification
 src/index.ts        entrypoint: `serve` (default; stdio or --http) and `pull`
-test/unit/*.test.ts unit tests (config, frontmatter, catalog, search, server via InMemoryTransport, pull, hardening)
+test/unit/*.test.ts unit tests (config, frontmatter, catalog, search, server via InMemoryTransport, pull, hardening, archive)
 test/smoke.ts       end-to-end test via a real MCP client (parametrised by root/name)
 test/nested.mjs     nested-path + duplicate-name test against test/fixtures/nested
 ```
