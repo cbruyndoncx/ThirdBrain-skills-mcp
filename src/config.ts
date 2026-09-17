@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import { isArchiveRoot, defaultCacheRoot, DEFAULT_LIMITS, type ExtractLimits } from "./archive.js";
+import { isUrlRoot } from "./remote.js";
 
 export interface Library {
   /** Namespace used as the first URI segment (skill://<ns>/<skill>/...). Empty string = un-namespaced single library. */
@@ -12,13 +13,17 @@ export interface Library {
   root: string;
   /** True when `root` is a `.zip` to be extracted rather than a directory. */
   archive?: boolean;
+  /** https URL of a `.zip` library. When set, `root` mirrors it for display only. */
+  url?: string;
+  /** sha256 pinned in configuration, verified before the archive is extracted. */
+  sha256?: string;
   /** Withhold executable files (scripts) from this library's manifests. */
   noScripts?: boolean;
 }
 
 /** Shape of the optional JSON config file (--config). Re-read on every rescan and on SIGHUP. */
 export interface ConfigFile {
-  libraries: { namespace: string; root: string; noScripts?: boolean }[];
+  libraries: { namespace: string; root?: string; url?: string; sha256?: string; noScripts?: boolean }[];
   noScripts?: boolean;
   lint?: boolean;
 }
@@ -60,6 +65,12 @@ export interface Config {
   cacheDir: string;
   /** Extraction ceilings for archive libraries. */
   archiveLimits: ExtractLimits;
+  /** Ceiling on bytes downloaded for a remote archive library. */
+  maxDownloadBytes: number;
+  /** Timeout for a single HTTP request when fetching a remote library. */
+  fetchTimeoutMs: number;
+  /** Bearer token for private archive assets. */
+  fetchToken?: string;
   http?: { port: number; host: string };
   statsOnly: boolean;
 }
@@ -75,7 +86,8 @@ usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefi
   --root DIR|ZIP     single un-namespaced library (skill://<skill>/...)          env SKILLS_ROOT
   --lib NS=DIR|ZIP   add a namespaced library (skill://NS/<skill>/...); repeatable env SKILLS_LIBS="bob=/a,gbl=/b.zip"
                      A .zip root is extracted to the cache dir before discovery; archives are
-                     never allowed *inside* a library.
+                     never allowed *inside* a library. The value may also be an https URL of a
+                     .zip, optionally pinned: https://host/lib.zip#sha256=<64 hex>
   --name NAME        MCP server name, default "skills"                           env SKILLS_NAME
   --prefix PREFIX    tool-name prefix, default = --name with '-' -> '_'          env SKILLS_TOOL_PREFIX
   --title TITLE      human title, default derived from name                     env SKILLS_TITLE
@@ -87,14 +99,26 @@ usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefi
   env SKILLS_MAX_FILE_BYTES (default 4 MiB), SKILLS_RESCAN_SECONDS (default 60)
   env SKILLS_CACHE_DIR (default ~/.cache/skills-mcp), SKILLS_MAX_ARCHIVE_BYTES (default 256 MiB),
       SKILLS_MAX_ARCHIVE_ENTRIES (default 8192)
+  env SKILLS_MAX_DOWNLOAD_BYTES (default 256 MiB), SKILLS_FETCH_TIMEOUT_MS (default 60000),
+      SKILLS_FETCH_TOKEN (or GH_TOKEN / GITHUB_TOKEN) for private archive assets
 `;
 
 export function validateLibraries(libs: Library[]): void {
   const seen = new Set<string>();
   for (const l of libs) {
-    if (typeof l.root !== "string" || !l.root) throw new Error(`library '${l.namespace}' has no root`);
-    l.root = path.resolve(l.root);
-    l.archive = isArchiveRoot(l.root);
+    if (l.url) {
+      let u: URL;
+      try { u = new URL(l.url); } catch { throw new Error(`library '${l.namespace || "(root)"}' has an invalid url '${l.url}'`); }
+      if (u.protocol !== "https:") throw new Error(`library '${l.namespace || "(root)"}' must use https, got '${u.protocol}//'`);
+      if (l.sha256 && !/^[0-9a-f]{64}$/i.test(l.sha256)) throw new Error(`library '${l.namespace || "(root)"}' has a malformed sha256 pin`);
+      l.sha256 = l.sha256?.toLowerCase();
+      l.root = l.url;      // identifier shown in stats and logs
+      l.archive = true;
+    } else {
+      if (typeof l.root !== "string" || !l.root) throw new Error(`library '${l.namespace}' has no root`);
+      l.root = path.resolve(l.root);
+      l.archive = isArchiveRoot(l.root);
+    }
     if (l.namespace && !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(l.namespace)) throw new Error(`library namespace '${l.namespace}' must match [a-zA-Z0-9][a-zA-Z0-9_.-]*`);
     if (seen.has(l.namespace)) throw new Error(`duplicate library namespace '${l.namespace || "(root)"}'`);
     seen.add(l.namespace);
@@ -108,7 +132,8 @@ export function readConfigFile(file: string): ConfigFile {
   if (!raw || typeof raw !== "object" || !Array.isArray((raw as any).libraries)) throw new Error(`config ${file}: expected {"libraries": [...]}`);
   const cf = raw as ConfigFile;
   const base = path.dirname(file);
-  cf.libraries = cf.libraries.map((l) => ({ ...l, root: path.resolve(base, String(l.root)) }));
+  // A url library has no root to resolve; String(undefined) would become a bogus "undefined" path.
+  cf.libraries = cf.libraries.map((l) => (l.url ? { ...l } : { ...l, root: path.resolve(base, String(l.root)) }));
   return cf;
 }
 
@@ -119,9 +144,9 @@ export function readConfigFile(file: string): ConfigFile {
 export function reloadConfigFile(cfg: Config, cliLibs: Library[]): boolean {
   if (!cfg.configFile) return false;
   const cf = readConfigFile(cfg.configFile);
-  const next: Library[] = [...cliLibs, ...cf.libraries.map((l) => ({ namespace: l.namespace, root: l.root, noScripts: l.noScripts }))];
+  const next: Library[] = [...cliLibs, ...cf.libraries.map((l) => ({ namespace: l.namespace, root: l.root ?? "", url: l.url, sha256: l.sha256, noScripts: l.noScripts }))];
   validateLibraries(next);
-  const key = (ls: Library[]) => JSON.stringify(ls.map((l) => [l.namespace, l.root, !!l.noScripts]));
+  const key = (ls: Library[]) => JSON.stringify(ls.map((l) => [l.namespace, l.root, l.url ?? "", l.sha256 ?? "", !!l.noScripts]));
   const changed = key(next) !== key(cfg.libraries) || !!cf.noScripts !== cfg.noScripts || (cf.lint === false) === cfg.lint;
   cfg.libraries.splice(0, cfg.libraries.length, ...next);
   cfg.root = next[0].root;
@@ -135,7 +160,20 @@ function parseLib(kv: string): Library {
   if (i <= 0) throw new Error(`--lib expects NS=DIR, got '${kv}'`);
   const namespace = kv.slice(0, i).trim();
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(namespace)) throw new Error(`library namespace '${namespace}' must match [a-zA-Z0-9][a-zA-Z0-9_.-]*`);
-  return { namespace, root: kv.slice(i + 1).trim() };
+  return { namespace, ...parseLibValue(kv.slice(i + 1).trim()) };
+}
+
+/**
+ * A library value is a directory, a .zip path, or an https URL of a .zip with an optional
+ * `#sha256=<64 hex>` pin. Shared by --lib and --root.
+ */
+function parseLibValue(value: string): { root: string; url?: string; sha256?: string } {
+  if (!isUrlRoot(value)) return { root: value };
+  const hash = value.indexOf("#sha256=");
+  if (hash > 0) {
+    return { root: "", url: value.slice(0, hash), sha256: value.slice(hash + 8).trim().toLowerCase() };
+  }
+  return { root: "", url: value };
 }
 
 function env(name: string): string | undefined {
@@ -177,10 +215,11 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     else if (a === "--help" || a === "-h") { process.stderr.write(HELP); process.exit(0); }
     else throw new Error(`Unknown argument ${a}\n${HELP}`);
   }
-  if (root) libs.unshift({ namespace: "", root });
+  // --root accepts a directory, a .zip, or an https URL (with an optional #sha256= pin).
+  if (root) libs.unshift({ namespace: "", ...parseLibValue(root) });
   if (configFile) {
     const cf = readConfigFile(path.resolve(configFile));
-    libs.push(...cf.libraries.map((l) => ({ namespace: l.namespace, root: l.root, noScripts: l.noScripts })));
+    libs.push(...cf.libraries.map((l) => ({ namespace: l.namespace, root: l.root ?? "", url: l.url, sha256: l.sha256, noScripts: l.noScripts })));
     if (cf.noScripts) noScripts = true;
     if (cf.lint === false) lint = false;
   }
@@ -209,6 +248,9 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     maxDiscoveryDepth: Number.isFinite(depth) && depth > 0 ? depth : 4,
     rescanSeconds: Number(env("RESCAN_SECONDS") ?? 60),
     cacheDir: env("CACHE_DIR") ? path.resolve(env("CACHE_DIR")!) : defaultCacheRoot(),
+    maxDownloadBytes: Number(env("MAX_DOWNLOAD_BYTES") ?? 256 * 1024 * 1024),
+    fetchTimeoutMs: Number(env("FETCH_TIMEOUT_MS") ?? 60_000),
+    fetchToken: env("FETCH_TOKEN") ?? process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN,
     archiveLimits: {
       ...DEFAULT_LIMITS,
       maxTotalBytes: Number(env("MAX_ARCHIVE_BYTES") ?? DEFAULT_LIMITS.maxTotalBytes),

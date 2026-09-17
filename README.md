@@ -94,7 +94,10 @@ the namespace as a folder; `--force` overwrites; `--dry-run` verifies without wr
 | `--depth` / `SKILLS_DEPTH` | `4` | Max discovery depth below root. |
 | `--show-disabled` / `SKILLS_HIDE_DISABLED=false` | hidden | Serve skills with `disable-model-invocation: true`. |
 | `SKILLS_MAX_FILE_BYTES` | 4 MiB | Files above this are not served. |
-| `SKILLS_CACHE_DIR` | `~/.cache/skills-mcp` | Where `.zip` libraries are extracted, keyed by content digest. |
+| `SKILLS_CACHE_DIR` | `~/.cache/skills-mcp` | Where `.zip` libraries are extracted and downloaded, keyed by content digest. |
+| `SKILLS_MAX_DOWNLOAD_BYTES` | 256 MiB | Ceiling on bytes read from the network for a remote library. |
+| `SKILLS_FETCH_TIMEOUT_MS` | `60000` | Timeout for a single HTTP request when fetching a remote library. |
+| `SKILLS_FETCH_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` | | Bearer token for private archive assets. |
 | `SKILLS_MAX_ARCHIVE_BYTES` | 256 MiB | Total uncompressed size an archive library may extract to. |
 | `SKILLS_MAX_ARCHIVE_ENTRIES` | `8192` | Max entries in an archive library. |
 | `SKILLS_RESCAN_SECONDS` | `60` | Background rescan interval (`0` disables). `<prefix>_catalog_status refresh=true` forces one. |
@@ -137,6 +140,53 @@ sneaky: bundles archive file(s) (notes.tgz, payload.zip); skills may not contain
 This applies to directory libraries too, and covers `.zip .tar .tgz .tar.gz .gz .bz2 .xz .7z .rar
 .jar .war .apk .iso .dmg .cab` — renaming a zip to `.tgz` does not get past it. The count appears in
 `--stats` as `archiveSkillsRejected`. One bad skill is withheld; the rest of the library still serves.
+
+### Remote (URL) libraries
+
+A library may also be an `https` URL of a `.zip`, so a published release can be served without
+checking anything out:
+
+```bash
+# pinned to a digest (recommended)
+skills-mcp --lib sales='https://host/pack-sales-free-v2.7.0.zip#sha256=fac65d24...'
+
+# or in the config file
+{"libraries": [{"namespace": "sales", "url": "https://host/pack.zip", "sha256": "fac65d24..."}]}
+```
+
+GitHub release assets work directly, including private ones — export `GH_TOKEN` and use the asset
+API URL:
+
+```bash
+export GH_TOKEN=$(gh auth token)
+skills-mcp --lib sales="https://api.github.com/repos/OWNER/REPO/releases/assets/<id>#sha256=<hex>"
+```
+
+**Integrity.** The archive is verified before extraction: against the `sha256` pinned in config, or
+failing that a `<url>.sha256` sidecar next to the asset. A mismatch is refused outright rather than
+served. Pinning is stronger than the sidecar, since the sidecar travels the same wire as the zip.
+
+**Caching.** Downloads are keyed by content digest, the same key the extractor uses. A pinned URL
+that has already been fetched never touches the network again — the second start of the server
+above scans in ~80 ms. A remote library is fetched once per process; change the URL or the pin to
+pick up a new version.
+
+**Failure handling.** If a refresh fails but a previous extraction is still cached, the cached copy
+keeps being served and a warning is recorded — a transient DNS blip during a background rescan will
+not empty a live library.
+
+**What is refused:**
+
+| Check | Why |
+|---|---|
+| Any scheme but `https`, on the initial URL **and every redirect** | No plaintext downgrade mid-chain |
+| More than 5 redirects | Redirect loops |
+| `Authorization` on a cross-host redirect | A token must not follow a redirect to another host. GitHub relies on this: it redirects asset URLs to a signed object store that must be called *without* the header |
+| `content-length` over the cap, or the body exceeding it mid-stream | A lying or absent `content-length` cannot smuggle a huge body onto disk |
+| A digest that does not match the pin or sidecar | Tampering or corruption |
+
+Query strings and fragments are stripped from anything logged, so credentials in a signed URL do
+not reach a log line.
 
 ### What is rejected in an archive
 
@@ -204,12 +254,13 @@ src/config.ts       env/CLI configuration
 src/frontmatter.ts  SKILL.md frontmatter parsing
 src/catalog.ts      directory scan, file inventory, digests, change detection
 src/archive.ts      zip-backed libraries: strict extraction, path/bomb/symlink defences, digest cache
+src/remote.ts       remote libraries: https fetch, redirect/credential rules, digest verification
 src/search.ts       ranked keyword search over name/description/tags/body
 src/server.ts       MCP wiring: extension methods, resources, tools, prompt
 src/lint.ts         scan-time risk linter (labels, never blocks)
 src/pull.ts         client: sync skills from a SEP-2640 server with digest verification
 src/index.ts        entrypoint: `serve` (default; stdio or --http) and `pull`
-test/unit/*.test.ts unit tests (config, frontmatter, catalog, search, server via InMemoryTransport, pull, hardening, archive)
+test/unit/*.test.ts unit tests (config, frontmatter, catalog, search, server via InMemoryTransport, pull, hardening, archive, remote)
 test/smoke.ts       end-to-end test via a real MCP client (parametrised by root/name)
 test/nested.mjs     nested-path + duplicate-name test against test/fixtures/nested
 ```

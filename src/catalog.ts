@@ -7,6 +7,7 @@ interface Discovered { skillPath: string; abs: string; library: string }
 import { splitFrontmatter, coerceString, coerceList } from "./frontmatter.js";
 import { lintFiles, SCRIPT_EXTENSIONS, type LintFinding } from "./lint.js";
 import { extractLibrary, pruneCache, isArchivePath } from "./archive.js";
+import { fetchArchive, pruneDownloads, redact } from "./remote.js";
 
 export interface SkillFile {
   /** Path relative to the skill directory, always with forward slashes. */
@@ -98,6 +99,8 @@ export class Catalog {
   private listeners = new Set<() => void>();
   /** Per-archive memo so an unchanged zip is not re-hashed or re-extracted on every rescan. */
   private archiveState = new Map<string, { mtimeMs: number; size: number; dir: string; digest: string }>();
+  /** Remote libraries, memoised by URL. A pinned release URL is fetched once per process. */
+  private remoteState = new Map<string, { dir: string; digest: string }>();
   private archiveRejected = 0;
 
   constructor(private cfg: Config) {}
@@ -174,15 +177,17 @@ export class Catalog {
     const nextHidden = new Map<string, Skill>();
     const dirs: Discovered[] = [];
     for (const lib of this.cfg.libraries) {
-      try { await fs.access(lib.root); } catch (e) {
-        if (this.cfg.libraries.length === 1) throw new Error(`Cannot read skills root ${lib.root}: ${(e as Error).message}`);
-        warnings.push(`library '${lib.namespace}': cannot read ${lib.root}: ${(e as Error).message}`);
-        continue;
+      if (!lib.url) {
+        try { await fs.access(lib.root); } catch (e) {
+          if (this.cfg.libraries.length === 1) throw new Error(`Cannot read skills root ${lib.root}: ${(e as Error).message}`);
+          warnings.push(`library '${lib.namespace}': cannot read ${lib.root}: ${(e as Error).message}`);
+          continue;
+        }
       }
       let effectiveRoot = lib.root;
       if (lib.archive) {
         try {
-          effectiveRoot = await this.resolveArchive(lib);
+          effectiveRoot = await this.resolveArchive(lib, warnings);
         } catch (e) {
           const msg = `archive library ${lib.root}: ${(e as Error).message}`;
           if (this.cfg.libraries.length === 1) throw new Error(msg);
@@ -193,9 +198,14 @@ export class Catalog {
       await this.discover(lib, effectiveRoot, lib.namespace, 0, dirs);
     }
     if (this.cfg.libraries.some((l) => l.archive)) {
-      // Drop extractions for archives that are no longer referenced or have been replaced.
-      const keep = new Set([...this.archiveState.values()].map((v) => v.digest));
+      // Drop extractions and downloads that are no longer referenced or have been replaced.
+      // Both are keyed by the archive's sha256, so one keep-set covers them.
+      const keep = new Set([
+        ...[...this.archiveState.values()].map((v) => v.digest),
+        ...[...this.remoteState.values()].map((v) => v.digest),
+      ]);
       await pruneCache(this.cfg.cacheDir, keep).catch(() => 0);
+      await pruneDownloads(this.cfg.cacheDir, keep).catch(() => 0);
     }
     const oldAll = new Map([...this.skills, ...this.hidden]);
 
@@ -253,7 +263,8 @@ export class Catalog {
    * when its mtime/size changed, so the usual rescan costs a single stat rather than a re-hash of
    * a large zip.
    */
-  private async resolveArchive(lib: Library): Promise<string> {
+  private async resolveArchive(lib: Library, warnings: string[]): Promise<string> {
+    if (lib.url) return this.resolveRemote(lib, warnings);
     const st = await fs.stat(lib.root);
     const prev = this.archiveState.get(lib.root);
     if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
@@ -262,6 +273,43 @@ export class Catalog {
     const r = await extractLibrary(lib.root, this.cfg.cacheDir, this.cfg.archiveLimits);
     this.archiveState.set(lib.root, { mtimeMs: st.mtimeMs, size: st.size, dir: r.dir, digest: r.digest });
     return r.dir;
+  }
+
+  /**
+   * Resolve a remote library to its extracted directory.
+   *
+   * Fetched once per process: a release URL is expected to be pinned to a tag, so re-fetching on
+   * every 60 s rescan would be pure waste. Changing the URL (or the pinned digest) in the config
+   * is what picks up a new version.
+   *
+   * Network failures are soft when a previous extraction is still on disk — a transient DNS blip
+   * during a background rescan must not empty a served library.
+   */
+  private async resolveRemote(lib: Library, warnings: string[]): Promise<string> {
+    const url = lib.url!;
+    const prev = this.remoteState.get(url);
+    if (prev) {
+      try { await fs.access(prev.dir); return prev.dir; } catch { /* extraction was cleared; refetch */ }
+    }
+    try {
+      const got = await fetchArchive(url, {
+        cacheDir: this.cfg.cacheDir,
+        maxBytes: this.cfg.maxDownloadBytes,
+        expectedSha256: lib.sha256,
+        useSidecar: !lib.sha256,
+        token: this.cfg.fetchToken,
+        timeoutMs: this.cfg.fetchTimeoutMs,
+      });
+      const r = await extractLibrary(got.file, this.cfg.cacheDir, this.cfg.archiveLimits);
+      this.remoteState.set(url, { dir: r.dir, digest: r.digest });
+      return r.dir;
+    } catch (e) {
+      if (prev) {
+        warnings.push(`library '${lib.namespace || "(root)"}': ${redact(url)} could not be refreshed (${(e as Error).message}); serving the cached copy`);
+        return prev.dir;
+      }
+      throw e;
+    }
   }
 
   /** Find directories containing SKILL.md, up to maxDiscoveryDepth. A skill directory is not descended into. */
