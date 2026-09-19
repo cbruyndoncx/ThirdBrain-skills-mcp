@@ -58,3 +58,24 @@ test("pull --sync: up-to-date folder costs no writes, changed and extra files ar
   assert.equal(await fs.readFile(path.join(tmp, "beta", "refs", "notes.md"), "utf8"), "notes here\n");
   await assert.rejects(fs.stat(path.join(tmp, "beta", "stray.txt")));
 });
+test("pull --sync: files and folders deleted on the server disappear from the cache; a deleted skill is left alone", async () => {
+  const lib = await fs.mkdtemp(path.join(os.tmpdir(), "pull-lib-"));
+  await fs.cp(libB, lib, { recursive: true });
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "pull-"));
+  const logs: string[] = [];
+  const base = { command: [tsx, entry, "--lib", `b=${lib}`], skills: ["beta"], all: false, list: false, keepPath: false, force: false, sync: true, dryRun: false, to: tmp, log: (m: string) => logs.push(m) };
+  assert.equal((await pull(base)).written, 3);
+  await fs.rm(path.join(lib, "beta", "refs", "notes.md"));
+  const one = await pull(base);
+  assert.equal(one.written, 0, "nothing to fetch, only a deletion");
+  await assert.rejects(fs.stat(path.join(tmp, "beta", "refs", "notes.md")));
+  assert.ok(await fs.stat(path.join(tmp, "beta", "refs", "pic.png")), "sibling survives");
+  assert.ok(logs.some((l) => l.startsWith("rm    b/beta/refs/notes.md")), logs.join("\n"));
+  await fs.rm(path.join(lib, "beta", "refs"), { recursive: true });
+  await pull(base);
+  await assert.rejects(fs.stat(path.join(tmp, "beta", "refs")), "emptied folder is pruned");
+  assert.ok(await fs.stat(path.join(tmp, "beta", "SKILL.md")), "skill folder itself stays");
+  await fs.rm(path.join(lib, "beta"), { recursive: true });
+  await assert.rejects(pull(base), /not found/);
+  assert.ok(await fs.stat(path.join(tmp, "beta", "SKILL.md")), "cache of a skill removed from the server is kept, not deleted");
+});

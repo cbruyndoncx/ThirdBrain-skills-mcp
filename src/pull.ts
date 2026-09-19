@@ -118,8 +118,9 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
         }
       }
       const todo = [...wanted].filter(([rel]) => !current.has(rel));
-      if (!todo.length) { o.log(`ok    ${sp} up to date at ${dest} (${wanted.size} files)`); skipped++; done.push(sp); continue; }
-      o.log(`${o.dryRun ? "would" : "pull "} ${sp} → ${dest} (${todo.length} of ${wanted.size} files)`);
+      const stale = o.sync && exists ? (await listFiles(dest)).filter((rel) => !wanted.has(rel)) : [];
+      if (!todo.length && !stale.length) { o.log(`ok    ${sp} up to date at ${dest} (${wanted.size} files)`); skipped++; done.push(sp); continue; }
+      if (todo.length) o.log(`${o.dryRun ? "would" : "pull "} ${sp} → ${dest} (${todo.length} of ${wanted.size} files)`);
       for (const [rel, r] of todo) {
         const res = await client.readResource({ uri: r.uri });
         const c = res.contents[0];
@@ -137,9 +138,11 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
         await fs.rename(tmp, target);
         written++;
       }
-      if (o.sync && exists && !o.dryRun) {
-        for (const rel of await listFiles(dest)) if (!wanted.has(rel)) { o.log(`rm    ${sp}/${rel} (no longer in the skill)`); await fs.rm(path.join(dest, ...rel.split("/"))); }
+      for (const rel of stale) {
+        o.log(`${o.dryRun ? "would rm" : "rm   "} ${sp}/${rel} (no longer in the skill)`);
+        if (!o.dryRun) await fs.rm(path.join(dest, ...rel.split("/")));
       }
+      if (stale.length && !o.dryRun) await pruneEmptyDirs(dest);
       done.push(sp);
     }
     return { written, skipped, skills: done };
@@ -171,6 +174,16 @@ async function listFiles(dir: string, base = dir): Promise<string[]> {
     else if (ent.isFile()) out.push(path.relative(base, abs).split(path.sep).join("/"));
   }
   return out;
+}
+
+/** Remove directories left empty by deletions, but never the skill folder itself. */
+async function pruneEmptyDirs(dir: string, root = dir): Promise<void> {
+  for (const ent of await fs.readdir(dir, { withFileTypes: true })) {
+    if (!ent.isDirectory()) continue;
+    const abs = path.join(dir, ent.name);
+    await pruneEmptyDirs(abs, root);
+    if ((await fs.readdir(abs)).length === 0) await fs.rmdir(abs);
+  }
 }
 
 async function sha256File(abs: string): Promise<string> {
