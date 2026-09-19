@@ -10,6 +10,8 @@ test("initialize: extension capability, instructions mention libraries", async (
   try {
     assert.deepEqual(client.getServerCapabilities()!.extensions, { "io.modelcontextprotocol/skills": { directoryRead: true } });
     assert.match(client.getInstructions()!, /Libraries served.*a, b/);
+    assert.match(client.getInstructions()!, /not installed locally/);
+    assert.doesNotMatch(client.getInstructions()!, /as if the skill were installed/);
     assert.equal(client.getServerVersion()!.name, "multi");
   } finally { await close(); }
 });
@@ -62,6 +64,9 @@ test("tools: prefix, outputSchema, structuredContent, library filter, ambiguity"
     const ok = await client.callTool({ name: "multi_get_skill", arguments: { name: "b/shared" } });
     assert.equal((ok.structuredContent as any).library, "b");
     assert.match((ok.structuredContent as any).instructions, /Shared B/);
+    assert.equal((ok.structuredContent as any).source, "multi");
+    assert.equal((ok.structuredContent as any).rootOnDisk, undefined);
+    assert.doesNotMatch((ok.content as any)[0].text, new RegExp(libB.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "no absolute paths in get_skill text");
     const libs = await client.callTool({ name: "multi_list_libraries", arguments: {} });
     assert.deepEqual((libs.structuredContent as any).libraries.map((l: any) => l.namespace), ["a", "b"]);
     const ls = await client.callTool({ name: "multi_list_skills", arguments: { limit: 3 } });
@@ -78,6 +83,8 @@ test("prompt use-skill inlines the skill body", async () => {
   const { client, close } = await connected(ARGS);
   try {
     const p = await client.getPrompt({ name: "use-skill", arguments: { skill: "alpha", task: "t" } });
-    assert.match((p.messages[0].content as any).text, /<skill name="alpha">[\s\S]*Body A/);
+    assert.match((p.messages[0].content as any).text, /<skill name="alpha" source="multi">[\s\S]*Body A/);
+    assert.match((p.messages[0].content as any).text, /Source: multi \(MCP-served skill/);
+    assert.doesNotMatch((p.messages[0].content as any).text, /Bundled scripts/, "no script guidance without scripts");
   } finally { await close(); }
 });

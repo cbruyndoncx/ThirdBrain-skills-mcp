@@ -236,6 +236,45 @@ The linter labels, it does not block. On BOB + GBL (786 skills) it flags 28, alm
 `curl … | sh` install instructions for third-party tools; those are legitimate but worth knowing
 before a host runs them. Rules live in `src/lint.ts`.
 
+## Bundled scripts
+
+Skills may ship scripts (`scripts/extract.py`), and this server serves them like any other file.
+What happens on the receiving side is up to the host; SEP-2640 sets the rules:
+
+* **Fetched on demand, verified, cached.** Hosts SHOULD cache skill files locally as they are read,
+  not in bulk, and MUST verify each file against its `sha256` digest from `skills/list` /
+  `skills/get`. The cache must be writable only by the host (or re-hashed on every use), live
+  outside every local skill-discovery path, and be separated per server.
+* **Cached is not local.** A cached script keeps its MCP origin, even after a restart or after the
+  server is disconnected. It never gains the trust of a filesystem skill.
+* **No execution without approval.** Hosts MUST NOT run a script from an MCP-served skill, or any
+  command its instructions direct the model to run, without explicit per-skill user approval. That
+  approval is bound to the skill's file set and digests; any change revokes it.
+* **No executable bits.** Files travel one by one as resources, without mode bits or symlinks, so a
+  script is run through its interpreter (`python scripts/extract.py`), never as `./extract.py`.
+
+Hosts without SEP-2640 support reach skills through the tools, so this server repeats those rules
+to the model. The server instructions, `get_skill` and the `use-skill` prompt label every skill with
+its source server (`Source: <name> (MCP-served skill, not installed locally)`). When a skill bundles
+scripts, the model is told to get the user's approval, check the digest and use an interpreter.
+`read_skill_file` attaches the same note, with the digest, to every executable file. Skill output
+(`get_skill`, `read_skill_file`, `use-skill`) only shows paths relative to the skill folder, never
+where the skill lives on the server's disk.
+
+For skill authors this means:
+
+* Reference scripts by path relative to the skill root, and show the interpreter in the command:
+  `python scripts/extract.py input.pdf`, not `./scripts/extract.py` or an absolute path.
+* Do not rely on a script's executable bit, on symlinks, or on files outside the skill directory.
+* Declare dependencies in `SKILL.md` (or a `requirements.txt` in the skill), since `.venv` and
+  `node_modules` are never served.
+* Expect a host to ask the user before running anything, and write instructions that still make
+  sense if the user says no.
+
+`pull` is an explicit install, not a spec cache: files written with `--to` into a folder the host
+scans for skills become local skills. Pull only from servers you trust, or use `--no-scripts` on
+the serving side to withhold scripts entirely.
+
 ## Spec conformance notes
 
 * URIs are `skill://<skill-path>/<relative-path>`; the last skill-path segment equals frontmatter `name`.

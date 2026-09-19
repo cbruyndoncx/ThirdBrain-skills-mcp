@@ -75,6 +75,25 @@ test("trust fields and risk flags reach _meta, search results and get_skill", as
     assert.equal(e.resources.length, 3);
   } finally { await close(); }
 });
+test("scripts carry origin and approval guidance in get_skill, read_skill_file and use-skill", async () => {
+  const { client, close } = await connected(["--lib", `c=${libC}`, "--name", "t"]);
+  try {
+    const g = await client.callTool({ name: "t_get_skill", arguments: { name: "risky" } });
+    const text = (g.content as any)[0].text as string;
+    assert.match(text, /Source: t \(MCP-served skill, not installed locally\)/);
+    assert.match(text, /Bundled scripts are executable content[\s\S]*approval[\s\S]*sha256[\s\S]*interpreter/);
+    assert.doesNotMatch(text, new RegExp(libC.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "no absolute paths");
+    const clean = await client.callTool({ name: "t_get_skill", arguments: { name: "clean" } });
+    assert.doesNotMatch((clean.content as any)[0].text, /Bundled scripts/);
+    const f = await client.callTool({ name: "t_read_skill_file", arguments: { name: "risky", path: "scripts/install.sh" } });
+    const sc = f.structuredContent as any;
+    assert.match(sc.note, /approval/);
+    assert.ok(sc.note.includes(sc.digest));
+    assert.match((f.content as any)[0].text, /^Executable content from t/);
+    const p = await client.getPrompt({ name: "use-skill", arguments: { skill: "risky" } });
+    assert.match((p.messages[0].content as any).text, /Bundled scripts are executable content/);
+  } finally { await close(); }
+});
 test("config file: load, reload adds/removes libraries, keeps CLI libs, tolerates a bad edit", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "cfg-"));
   const cfgPath = path.join(tmp, "skills.json");
