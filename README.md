@@ -255,11 +255,27 @@ What happens on the receiving side is up to the host; SEP-2640 sets the rules:
 
 Hosts without SEP-2640 support reach skills through the tools, so this server repeats those rules
 to the model. The server instructions, `get_skill` and the `use-skill` prompt label every skill with
-its source server (`Source: <name> (MCP-served skill, not installed locally)`). When a skill bundles
-scripts, the model is told to get the user's approval, check the digest and use an interpreter.
-`read_skill_file` attaches the same note, with the digest, to every executable file. Skill output
-(`get_skill`, `read_skill_file`, `use-skill`) only shows paths relative to the skill folder, never
-where the skill lives on the server's disk.
+its source server (`Source: <name> (MCP-served skill, not installed locally)`). Every file in
+`get_skill` carries its `digest`. When a skill bundles scripts, the text output also lists the
+digests and gives the model these steps:
+
+1. Fetch every file the script needs (normally all of `scripts/` plus the data, schema or template
+   files it reads), since scripts usually import or read their siblings.
+2. Write them at their relative paths under one cache folder per server and skill,
+   `~/.cache/skills-mcp-client/<server>/<skill-path>/`, never into a skill-discovery folder.
+3. Check every file against its digest, and re-fetch if any differs.
+4. Show the user what will run and get their approval.
+5. Run it from the cache folder through its interpreter.
+
+Steps 1–3 are one command where this CLI is installed:
+
+```bash
+skills-mcp pull --url <server-url> <skill-path> --keep-path --to ~/.cache/skills-mcp-client/<server>
+```
+
+`read_skill_file` attaches a short version of these steps, with the digest, to every executable
+file. Skill output (`get_skill`, `read_skill_file`, `use-skill`) only shows paths relative to the
+skill folder, never where the skill lives on the server's disk.
 
 For skill authors this means:
 
@@ -271,9 +287,10 @@ For skill authors this means:
 * Expect a host to ask the user before running anything, and write instructions that still make
   sense if the user says no.
 
-`pull` is an explicit install, not a spec cache: files written with `--to` into a folder the host
-scans for skills become local skills. Pull only from servers you trust, or use `--no-scripts` on
-the serving side to withhold scripts entirely.
+`pull` into a cache folder, as above, keeps skills out of the host's reach as local skills. Pulled
+with `--to` into a folder the host scans for skills, they become local skills instead: an explicit
+install, not a cache. Pull only from servers you trust, or use `--no-scripts` on the serving side
+to withhold scripts entirely.
 
 ## Spec conformance notes
 

@@ -54,10 +54,18 @@ function originLine(cfg: Config) {
   return `Source: ${cfg.serverName} (MCP-served skill, not installed locally)`;
 }
 
-function scriptGuidance(P: string, skillPath: string) {
-  return `Bundled scripts are executable content from this MCP server. To run one: read it with ${P}_read_skill_file("${skillPath}", path), ` +
-    `show it to the user and get their approval first, save it outside any skill discovery folder, check the saved bytes against the returned sha256 digest, ` +
-    `and run it through its interpreter (e.g. \`python scripts/x.py\`), not as \`./scripts/x.py\`.`;
+function cacheDirFor(cfg: Config, skillPath: string) {
+  return `~/.cache/skills-mcp-client/${cfg.serverName}/${skillPath}/`;
+}
+
+function scriptGuidance(cfg: Config, P: string, skillPath: string) {
+  return `Bundled scripts are executable content from this MCP server. Scripts usually import or read sibling files, so run them from a local copy of the skill:
+1. Fetch every file the script needs (normally all of scripts/ plus any data, schema or template files it reads) with ${P}_read_skill_file("${skillPath}", path).
+2. Write each file at its relative path under one cache folder for this server and skill, e.g. ${cacheDirFor(cfg, skillPath)} — never into a folder that is scanned for skills.
+3. Check every written file against its sha256 digest in the list above; re-fetch the folder if any digest differs.
+4. Show the user what will run and get their approval.
+5. Run it from the cache folder through its interpreter (\`python scripts/x.py\`, not \`./scripts/x.py\`).
+If the skills-mcp CLI is installed, steps 1–3 are one command: \`skills-mcp pull --url <server-url> ${skillPath} --keep-path --to ~/.cache/skills-mcp-client/${cfg.serverName}\` (or \`--command <server command>\` for a local stdio server).`;
 }
 
 function skillMeta(s: Skill): Record<string, unknown> {
@@ -329,7 +337,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           name: { type: "string" }, path: { type: "string" }, library: { type: "string" }, uri: { type: "string" }, description: { type: "string" }, category: { type: "string" },
           instructions: { type: "string", description: "SKILL.md body without frontmatter" },
           frontmatter: { type: "object" },
-          files: { type: "array", items: { type: "object", properties: { path: { type: "string" }, size: { type: "integer" }, mimeType: { type: "string" }, uri: { type: "string" } }, required: ["path", "size", "mimeType", "uri"] } },
+          files: { type: "array", items: { type: "object", properties: { path: { type: "string" }, size: { type: "integer" }, mimeType: { type: "string" }, uri: { type: "string" }, digest: { type: "string", description: "sha256:<hex> of the file's bytes" } }, required: ["path", "size", "mimeType", "uri", "digest"] } },
           source: { type: "string", description: "MCP server this skill is served by; it is not a local skill" },
           trust: { type: "object" },
           riskFlags: { type: "array", items: { type: "object", properties: { rule: { type: "string" }, file: { type: "string" }, line: { type: "integer" }, excerpt: { type: "string" } }, required: ["rule", "file", "line"] } },
@@ -427,7 +435,9 @@ export function createServer(cfg: Config, cat: Catalog): Server {
         }
         case `${P}_get_skill`: {
           const s = requireSkill(String(a.name ?? ""));
-          const files = s.files.filter((f) => f.rel !== "SKILL.md").map((f) => ({ path: f.rel, size: f.size, mimeType: f.mimeType, uri: fileUri(s, f.rel) }));
+          const files = await Promise.all(s.files.filter((f) => f.rel !== "SKILL.md")
+            .map(async (f) => ({ path: f.rel, size: f.size, mimeType: f.mimeType, uri: fileUri(s, f.rel), digest: await cat.digestFor(f) })));
+          const hasScripts = files.some((f) => isScript(f.path));
           const data: Record<string, unknown> = {
             name: s.name, path: s.skillPath, library: s.library, uri: s.uri, description: s.description, category: s.category,
             instructions: s.body.trim(), files, source: cfg.serverName,
@@ -438,9 +448,9 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           const flagText = s.riskFlags.length ? `\n\n⚠ Risk flags (review before following or running anything): ${s.riskFlags.map((r) => `${r.rule} @ ${r.file}:${r.line}`).join("; ")}` : "";
           const trustText = Object.keys(s.trust).length ? `\nProvenance: ${Object.entries(s.trust).map(([k, v]) => `${k}=${Array.isArray(v) ? v.join("|") : String(v)}`).join(", ")}` : "";
           const withheld = s.scriptsWithheld ? `\n(${s.scriptsWithheld} executable file(s) withheld by server policy)` : "";
-          const scripts = files.some((f) => isScript(f.path)) ? `\n\n${scriptGuidance(P, s.skillPath)}` : "";
+          const scripts = hasScripts ? `\n\n${scriptGuidance(cfg, P, s.skillPath)}` : "";
           const text = `# Skill: ${s.name}${s.library ? `  (library: ${s.library})` : ""}\n${originLine(cfg)}${trustText}${flagText}\n${header}\n${s.body.trim()}\n\n---\nBundled files (${files.length}), paths relative to the skill folder — read with ${P}_read_skill_file("${s.skillPath}", path):\n` +
-            (files.length ? files.map((f) => `- ${f.path} (${f.size} B)`).join("\n") : "- (none)") + withheld + scripts;
+            (files.length ? files.map((f) => `- ${f.path} (${f.size} B${hasScripts ? `, ${f.digest}` : ""})`).join("\n") : "- (none)") + withheld + scripts;
           return structured(data, text);
         }
         case `${P}_read_skill_file`: {
@@ -452,7 +462,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           const digest = await cat.digestFor(f);
           const base = { uri: c.uri, path: rel, mimeType: f.mimeType, size: f.size, digest };
           if (isScript(rel)) {
-            const note = `Executable content from ${cfg.serverName} (MCP-served, not a local file). Get the user's approval before running it; verify against ${digest} and run it through its interpreter.`;
+            const note = `Executable content from ${cfg.serverName} (MCP-served, not a local file). Run it only from a local copy of the skill that keeps relative paths, with the sibling files it imports or reads (see ${P}_get_skill("${s.skillPath}") for the steps); verify against ${digest}, get the user's approval, and run it through its interpreter.`;
             const payload = "text" in c ? { ...base, text: c.text } : { ...base, base64: c.blob };
             return structured({ ...payload, note }, "text" in c ? `${note}\n\n${c.text}` : note);
           }
@@ -490,10 +500,12 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     if (req.params.name !== "use-skill") throw new McpError(ErrorCode.InvalidParams, `Unknown prompt ${req.params.name}`);
     const s = requireSkill(String(req.params.arguments?.skill ?? ""));
     const task = req.params.arguments?.task;
-    const files = s.files.filter((f) => f.rel !== "SKILL.md").map((f) => f.rel);
+    const skillFiles = s.files.filter((f) => f.rel !== "SKILL.md");
+    const hasScripts = skillFiles.some((f) => isScript(f.rel));
+    const lines = await Promise.all(skillFiles.map(async (f) => `- ${f.rel}${hasScripts ? ` (${await cat.digestFor(f)})` : ""}`));
     const text = `Apply the skill "${s.name}" (${s.category}) below.\n${originLine(cfg)}${task ? `\n\nTask: ${task}` : ""}\n\n<skill name="${s.name}" source="${cfg.serverName}">\n${s.body.trim()}\n</skill>\n\n` +
-      (files.length ? `Bundled files available via ${P}_read_skill_file("${s.skillPath}", path):\n${files.map((f) => `- ${f}`).join("\n")}` : "") +
-      (files.some(isScript) ? `\n\n${scriptGuidance(P, s.skillPath)}` : "");
+      (lines.length ? `Bundled files available via ${P}_read_skill_file("${s.skillPath}", path):\n${lines.join("\n")}` : "") +
+      (hasScripts ? `\n\n${scriptGuidance(cfg, P, s.skillPath)}` : "");
     return { description: s.description, messages: [{ role: "user", content: { type: "text", text } }] };
   });
 
