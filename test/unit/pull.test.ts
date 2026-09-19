@@ -21,7 +21,7 @@ test("parsePullArgs", () => {
 test("pull over stdio: list, fetch by name and path, digest-verified, skip existing, keep-path", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "pull-"));
   const logs: string[] = [];
-  const base = { command: serverCmd, all: false, list: false, keepPath: false, force: false, dryRun: false, log: (m: string) => logs.push(m) };
+  const base = { command: serverCmd, all: false, list: false, keepPath: false, force: false, sync: false, dryRun: false, log: (m: string) => logs.push(m) };
   const listed = await pull({ ...base, skills: [], list: true, to: tmp });
   assert.deepEqual(listed.skills, ["a/alpha", "a/shared", "b/beta", "b/shared"]);
   const r = await pull({ ...base, skills: ["beta", "b/shared"], to: tmp });
@@ -40,4 +40,21 @@ test("pull over stdio: list, fetch by name and path, digest-verified, skip exist
   const dry = await pull({ ...base, skills: ["alpha"], to: tmp, dryRun: true });
   assert.equal(dry.written, 0);
   await assert.rejects(fs.stat(path.join(tmp, "alpha")));
+});
+test("pull --sync: up-to-date folder costs no writes, changed and extra files are repaired", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "pull-"));
+  const logs: string[] = [];
+  const base = { command: serverCmd, skills: ["beta"], all: false, list: false, keepPath: false, force: false, sync: true, dryRun: false, to: tmp, log: (m: string) => logs.push(m) };
+  const first = await pull(base);
+  assert.equal(first.written, 3);
+  const same = await pull(base);
+  assert.equal(same.written, 0);
+  assert.deepEqual(same.skills, ["b/beta"]);
+  assert.ok(logs.some((l) => /^ok {4}b\/beta up to date/.test(l)), logs.join("\n"));
+  await fs.writeFile(path.join(tmp, "beta", "refs", "notes.md"), "tampered\n");
+  await fs.writeFile(path.join(tmp, "beta", "stray.txt"), "x");
+  const fixed = await pull(base);
+  assert.equal(fixed.written, 1, "only the tampered file is re-fetched");
+  assert.equal(await fs.readFile(path.join(tmp, "beta", "refs", "notes.md"), "utf8"), "notes here\n");
+  await assert.rejects(fs.stat(path.join(tmp, "beta", "stray.txt")));
 });

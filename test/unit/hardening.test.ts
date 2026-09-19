@@ -81,9 +81,10 @@ test("scripts carry origin and approval guidance in get_skill, read_skill_file a
     const g = await client.callTool({ name: "t_get_skill", arguments: { name: "risky" } });
     const text = (g.content as any)[0].text as string;
     assert.match(text, /Source: t \(MCP-served skill, not installed locally\)/);
-    assert.match(text, /Bundled scripts are executable content[\s\S]*sha256[\s\S]*approval[\s\S]*interpreter/);
+    assert.match(text, /Bundled scripts are executable content[\s\S]*skills-mcp pull --sync[\s\S]*approval[\s\S]*interpreter/);
     assert.match(text, /~\/\.cache\/skills-mcp-client\/t\/c\/risky\//, "cache folder per server and skill");
-    assert.match(text, /skills-mcp pull --url <server-url> c\/risky --keep-path --to ~\/\.cache\/skills-mcp-client\/t/);
+    assert.match(text, /skills-mcp pull --sync --keep-path --to ~\/\.cache\/skills-mcp-client\/t c\/risky --url/);
+    assert.ok(text.indexOf("skills-mcp pull") < text.indexOf("t_read_skill_file(\"c/risky\", path) for every"), "pull comes before the read_skill_file fallback");
     assert.match(text, /- scripts\/ok\.py \(\d+ B, sha256:[0-9a-f]{64}\)/, "digests listed when the skill has scripts");
     for (const file of (g.structuredContent as any).files) assert.match(file.digest, /^sha256:[0-9a-f]{64}$/);
     assert.doesNotMatch(text, new RegExp(libC.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "no absolute paths");
@@ -94,7 +95,7 @@ test("scripts carry origin and approval guidance in get_skill, read_skill_file a
     const sc = f.structuredContent as any;
     assert.match(sc.note, /approval/);
     assert.ok(sc.note.includes(sc.digest));
-    assert.match(sc.note, /local copy of the skill that keeps relative paths/);
+    assert.match(sc.note, /Do not run it from this output.*skills-mcp pull --sync/);
     assert.match((f.content as any)[0].text, /^Executable content from t/);
     const p = await client.getPrompt({ name: "use-skill", arguments: { skill: "risky" } });
     assert.match((p.messages[0].content as any).text, /Bundled scripts are executable content/);

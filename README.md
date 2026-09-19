@@ -79,7 +79,11 @@ node dist/index.js pull --all --keep-path --to ./skills --command node dist/inde
 
 `pull` walks `skills/list`, reads every file with `resources/read`, verifies each sha256 digest
 against the manifest, refuses paths outside the skill, and writes atomically. `--keep-path` keeps
-the namespace as a folder; `--force` overwrites; `--dry-run` verifies without writing.
+the namespace as a folder; `--force` overwrites; `--dry-run` verifies without writing. `--sync`
+updates an existing folder in place: files whose sha256 already matches are kept without a network
+read, changed or missing ones are fetched, and files no longer in the skill are deleted, so a
+re-run on an unchanged skill costs one `skills/list` and some local hashing. Without the CLI
+installed, `npx github:cbruyndoncx/ThirdBrain-skills-mcp pull ...` builds and runs it.
 
 ## Configuration
 
@@ -257,21 +261,17 @@ Hosts without SEP-2640 support reach skills through the tools, so this server re
 to the model. The server instructions, `get_skill` and the `use-skill` prompt label every skill with
 its source server (`Source: <name> (MCP-served skill, not installed locally)`). Every file in
 `get_skill` carries its `digest`. When a skill bundles scripts, the text output also lists the
-digests and gives the model these steps:
+digests and tells the model to run scripts only from a verified local copy of the whole skill,
+because scripts import or read their sibling files:
 
-1. Fetch every file the script needs (normally all of `scripts/` plus the data, schema or template
-   files it reads), since scripts usually import or read their siblings.
-2. Write them at their relative paths under one cache folder per server and skill,
-   `~/.cache/skills-mcp-client/<server>/<skill-path>/`, never into a skill-discovery folder.
-3. Check every file against its digest, and re-fetch if any differs.
-4. Show the user what will run and get their approval.
-5. Run it from the cache folder through its interpreter.
-
-Steps 1–3 are one command where this CLI is installed:
-
-```bash
-skills-mcp pull --url <server-url> <skill-path> --keep-path --to ~/.cache/skills-mcp-client/<server>
-```
+1. Copy the skill into a cache folder that no host scans for skills, preferably with
+   `skills-mcp pull --sync --keep-path --to ~/.cache/skills-mcp-client/<server> <skill-path>`
+   (`--url` or `--command` as the client is configured). No file content passes through the
+   conversation, digests are verified, and re-running it each session is cheap thanks to `--sync`.
+   Only when the CLI cannot run: `read_skill_file` per needed file, written byte-for-byte at its
+   relative path and checked against the digests, never retyped.
+2. Show the user what will run and get their approval.
+3. Run from `~/.cache/skills-mcp-client/<server>/<skill-path>/` through the interpreter.
 
 `read_skill_file` attaches a short version of these steps, with the digest, to every executable
 file. Skill output (`get_skill`, `read_skill_file`, `use-skill`) only shows paths relative to the

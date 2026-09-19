@@ -25,6 +25,8 @@ export interface PullOptions {
   to: string;
   keepPath: boolean;
   force: boolean;
+  /** Update an existing folder in place: keep files whose sha256 matches, fetch the rest, delete files not in the manifest. */
+  sync: boolean;
   dryRun: boolean;
   log: (msg: string) => void;
 }
@@ -98,13 +100,27 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
         resources = g.resources === "dynamic" ? [{ uri: e.uri, digest: "", size: 0 }] : g.resources;
       }
       const exists = await fs.stat(dest).then(() => true, () => false);
-      if (exists && !o.force) { o.log(`skip  ${sp} (exists at ${dest}; use --force)`); skipped++; continue; }
-      o.log(`${o.dryRun ? "would" : "pull "} ${sp} → ${dest} (${resources.length} files)`);
+      if (exists && !o.force && !o.sync) { o.log(`skip  ${sp} (exists at ${dest}; use --force or --sync)`); skipped++; continue; }
       const prefix = e.uri.replace(/SKILL\.md$/, "");
+      const wanted = new Map<string, (typeof resources)[number]>();
       for (const r of resources) {
         if (!r.uri.startsWith(prefix)) throw new Error(`${sp}: resource ${r.uri} is outside the skill`);
         const rel = r.uri.slice(prefix.length).split("/").map(decodeURIComponent).join("/");
         if (rel.split("/").some((seg) => seg === ".." || seg === "" )) throw new Error(`${sp}: unsafe path ${rel}`);
+        wanted.set(rel, r);
+      }
+      // --sync: a local file whose bytes already hash to the manifest digest is kept without a network read.
+      const current = new Set<string>();
+      if (o.sync && exists) {
+        for (const rel of await listFiles(dest)) {
+          const r = wanted.get(rel);
+          if (r?.digest && (await sha256File(path.join(dest, ...rel.split("/")))) === r.digest) current.add(rel);
+        }
+      }
+      const todo = [...wanted].filter(([rel]) => !current.has(rel));
+      if (!todo.length) { o.log(`ok    ${sp} up to date at ${dest} (${wanted.size} files)`); skipped++; done.push(sp); continue; }
+      o.log(`${o.dryRun ? "would" : "pull "} ${sp} → ${dest} (${todo.length} of ${wanted.size} files)`);
+      for (const [rel, r] of todo) {
         const res = await client.readResource({ uri: r.uri });
         const c = res.contents[0];
         if (!c) throw new Error(`${sp}: empty read for ${r.uri}`);
@@ -121,6 +137,9 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
         await fs.rename(tmp, target);
         written++;
       }
+      if (o.sync && exists && !o.dryRun) {
+        for (const rel of await listFiles(dest)) if (!wanted.has(rel)) { o.log(`rm    ${sp}/${rel} (no longer in the skill)`); await fs.rm(path.join(dest, ...rel.split("/"))); }
+      }
       done.push(sp);
     }
     return { written, skipped, skills: done };
@@ -129,7 +148,7 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
   }
 }
 
-const PULL_HELP = `skills-mcp pull [skill ...] (--url URL | --command CMD [ARGS...]) --to DIR [--all] [--list] [--keep-path] [--force] [--dry-run]
+const PULL_HELP = `skills-mcp pull [skill ...] (--url URL | --command CMD [ARGS...]) --to DIR [--all] [--list] [--keep-path] [--sync] [--force] [--dry-run]
 
   Sync skills from any SEP-2640 server into DIR/<skill-name>/ with sha256 verification.
   --url URL          Streamable HTTP endpoint, e.g. http://127.0.0.1:3939/mcp
@@ -138,12 +157,28 @@ const PULL_HELP = `skills-mcp pull [skill ...] (--url URL | --command CMD [ARGS.
   --all              pull every skill the server lists
   --list             only list skills on the server
   --keep-path        use the full skill path (incl. namespace) as the folder name
+  --sync             update existing skill folders in place: keep files whose sha256 already
+                     matches (no network read), fetch the rest, delete files not in the skill
   --force            overwrite existing skill folders
   --dry-run          verify digests but write nothing
 `;
 
+async function listFiles(dir: string, base = dir): Promise<string[]> {
+  const out: string[] = [];
+  for (const ent of await fs.readdir(dir, { withFileTypes: true })) {
+    const abs = path.join(dir, ent.name);
+    if (ent.isDirectory()) out.push(...await listFiles(abs, base));
+    else if (ent.isFile()) out.push(path.relative(base, abs).split(path.sep).join("/"));
+  }
+  return out;
+}
+
+async function sha256File(abs: string): Promise<string> {
+  return "sha256:" + createHash("sha256").update(await fs.readFile(abs)).digest("hex");
+}
+
 export function parsePullArgs(argv: string[]): PullOptions {
-  const o: PullOptions = { skills: [], all: false, list: false, to: "./skills", keepPath: false, force: false, dryRun: false, log: (m) => process.stderr.write(m + "\n") };
+  const o: PullOptions = { skills: [], all: false, list: false, to: "./skills", keepPath: false, force: false, sync: false, dryRun: false, log: (m) => process.stderr.write(m + "\n") };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => { const v = argv[++i]; if (v === undefined) throw new Error(`${a} needs a value\n${PULL_HELP}`); return v; };
@@ -154,6 +189,7 @@ export function parsePullArgs(argv: string[]): PullOptions {
     else if (a === "--list") o.list = true;
     else if (a === "--keep-path") o.keepPath = true;
     else if (a === "--force") o.force = true;
+    else if (a === "--sync") o.sync = true;
     else if (a === "--dry-run") o.dryRun = true;
     else if (a === "--help" || a === "-h") { process.stderr.write(PULL_HELP); process.exit(0); }
     else if (a.startsWith("--")) throw new Error(`Unknown argument ${a}\n${PULL_HELP}`);

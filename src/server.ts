@@ -59,13 +59,14 @@ function cacheDirFor(cfg: Config, skillPath: string) {
 }
 
 function scriptGuidance(cfg: Config, P: string, skillPath: string) {
-  return `Bundled scripts are executable content from this MCP server. Scripts usually import or read sibling files, so run them from a local copy of the skill:
-1. Fetch every file the script needs (normally all of scripts/ plus any data, schema or template files it reads) with ${P}_read_skill_file("${skillPath}", path).
-2. Write each file at its relative path under one cache folder for this server and skill, e.g. ${cacheDirFor(cfg, skillPath)} — never into a folder that is scanned for skills.
-3. Check every written file against its sha256 digest in the list above; re-fetch the folder if any digest differs.
-4. Show the user what will run and get their approval.
-5. Run it from the cache folder through its interpreter (\`python scripts/x.py\`, not \`./scripts/x.py\`).
-If the skills-mcp CLI is installed, steps 1–3 are one command: \`skills-mcp pull --url <server-url> ${skillPath} --keep-path --to ~/.cache/skills-mcp-client/${cfg.serverName}\` (or \`--command <server command>\` for a local stdio server).`;
+  const cache = `~/.cache/skills-mcp-client/${cfg.serverName}`;
+  return `Bundled scripts are executable content from this MCP server. They import or read sibling files, so run them from a verified local copy of the whole skill, never from tool output:
+1. Copy the skill into a cache folder, never into a folder that is scanned for skills. Preferred, no file content passes through the conversation:
+   \`skills-mcp pull --sync --keep-path --to ${cache} ${skillPath} --url <this server's URL>\` (for a stdio server: \`--command <this server's command from your MCP client config>\`).
+   Use \`npx github:cbruyndoncx/ThirdBrain-skills-mcp pull ...\` if skills-mcp is not installed. --sync keeps files that already match, fetches only changed ones, and deletes stale ones, so re-running it each session is cheap.
+   Fallback only if you cannot run the CLI: ${P}_read_skill_file("${skillPath}", path) for every needed file, written byte-for-byte at its relative path under ${cache}/${skillPath}/ and checked against the sha256 digests listed above. Never retype file content; skip binary files you do not need.
+2. Show the user what will run and get their approval.
+3. Run from ${cache}/${skillPath}/ through the interpreter (\`python scripts/x.py\`, not \`./scripts/x.py\`).`;
 }
 
 function skillMeta(s: Skill): Record<string, unknown> {
@@ -462,7 +463,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           const digest = await cat.digestFor(f);
           const base = { uri: c.uri, path: rel, mimeType: f.mimeType, size: f.size, digest };
           if (isScript(rel)) {
-            const note = `Executable content from ${cfg.serverName} (MCP-served, not a local file). Run it only from a local copy of the skill that keeps relative paths, with the sibling files it imports or reads (see ${P}_get_skill("${s.skillPath}") for the steps); verify against ${digest}, get the user's approval, and run it through its interpreter.`;
+            const note = `Executable content from ${cfg.serverName} (MCP-served, not a local file). Do not run it from this output: copy the whole skill with \`skills-mcp pull --sync\` (steps in ${P}_get_skill("${s.skillPath}")), verify against ${digest}, get the user's approval, and run it from the cache folder through its interpreter.`;
             const payload = "text" in c ? { ...base, text: c.text } : { ...base, base64: c.blob };
             return structured({ ...payload, note }, "text" in c ? `${note}\n\n${c.text}` : note);
           }
