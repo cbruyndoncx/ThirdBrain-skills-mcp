@@ -218,7 +218,9 @@ node dist/index.js --config skills.json          # re-read on every rescan (defa
 
 ```json
 { "libraries": [
-    { "namespace": "bob", "root": "/mnt/d/OBS/brncx-skills/00-CORE/Agents/skills" },
+    { "namespace": "bob", "root": "/mnt/d/OBS/brncx-skills/00-CORE/Agents/skills",
+      "title": "BOB – Business Operating Brain", "vault": "brncx-skills", "version": "2026.09",
+      "metadata": { "channel": "stable" } },
     { "namespace": "gbl", "root": "../gbl-skills/00-CORE/Agents/skills", "noScripts": true } ],
   "noScripts": false, "lint": true }
 ```
@@ -227,6 +229,15 @@ Libraries from the file can be added, removed or re-pointed while the server run
 on the command line stay fixed. Relative roots resolve against the file's directory. A broken edit is
 logged and the previous set is kept. Changes trigger `resources`, `tools` and `prompts`
 `list_changed` notifications. `kill -HUP <pid>` forces an immediate reload.
+
+**Library paths never leave the server.** `list_libraries`, `catalog_status`, the `initialize`
+instructions and skill output show what is loaded, not where it is: the optional `title`, `vault`
+(the vault or repository the library is exported from), `version` and free-form string `metadata`
+from the config file, the `source` kind (`directory`, `archive`, `url`), and for archive and url
+libraries the sha256 of the archive currently extracted. Warnings returned by `catalog_status`
+have root paths replaced by `<namespace>`. Roots still appear in the server log and in `--stats`,
+which are for the operator. Metadata fields are only available in the config file; a library given
+as `--lib NS=DIR` shows its namespace and source kind.
 
 The server never executes anything. Three additional layers label or withhold risky content:
 

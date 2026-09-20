@@ -19,11 +19,28 @@ export interface Library {
   sha256?: string;
   /** Withhold executable files (scripts) from this library's manifests. */
   noScripts?: boolean;
+  /** Descriptive metadata shown to clients instead of the root path. */
+  info?: LibraryInfo;
+}
+
+/**
+ * What a client may learn about a library. Paths are never shown over MCP, so this is how an
+ * operator says what is loaded: the vault it comes from, its version, and anything else useful.
+ */
+export interface LibraryInfo {
+  /** Human title, e.g. "BOB – ThirdBrain Business Operating Brain". */
+  title?: string;
+  /** Name of the vault (or repository) the library is exported from, e.g. "brncx-skills". */
+  vault?: string;
+  /** Version of the library content, e.g. "2026.09" or a git tag. */
+  version?: string;
+  /** Free-form string pairs, e.g. {"maintainer": "...", "channel": "stable"}. */
+  metadata?: Record<string, string>;
 }
 
 /** Shape of the optional JSON config file (--config). Re-read on every rescan and on SIGHUP. */
 export interface ConfigFile {
-  libraries: { namespace: string; root?: string; url?: string; sha256?: string; noScripts?: boolean }[];
+  libraries: ({ namespace: string; root?: string; url?: string; sha256?: string; noScripts?: boolean } & LibraryInfo)[];
   noScripts?: boolean;
   lint?: boolean;
 }
@@ -80,7 +97,8 @@ const HELP = `skills-mcp — serve a directory of Agent Skills (SKILL.md folders
 usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefix PREFIX] [--title TITLE] [--http PORT] [--show-disabled] [--stats]
        skills-mcp pull --help        sync skills from any SEP-2640 server to disk
 
-  --config FILE      JSON {libraries:[{namespace,root,noScripts?}],noScripts?,lint?}; re-read on rescan/SIGHUP   env SKILLS_CONFIG
+  --config FILE      JSON {libraries:[{namespace,root|url,noScripts?,title?,vault?,version?,metadata?}],noScripts?,lint?}
+                     re-read on rescan/SIGHUP                                        env SKILLS_CONFIG
   --no-scripts       withhold executable files (.sh .py .js .ps1 ...) from all manifests      env SKILLS_NO_SCRIPTS=true
   --no-lint          disable the scan-time risk linter                                        env SKILLS_LINT=false
   --root DIR|ZIP     single un-namespaced library (skill://<skill>/...)          env SKILLS_ROOT
@@ -120,10 +138,34 @@ export function validateLibraries(libs: Library[]): void {
       l.archive = isArchiveRoot(l.root);
     }
     if (l.namespace && !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(l.namespace)) throw new Error(`library namespace '${l.namespace}' must match [a-zA-Z0-9][a-zA-Z0-9_.-]*`);
+    if (l.info) validateInfo(l.namespace, l.info);
     if (seen.has(l.namespace)) throw new Error(`duplicate library namespace '${l.namespace || "(root)"}'`);
     seen.add(l.namespace);
   }
   if (libs.length > 1 && libs.some((l) => !l.namespace)) throw new Error(`--root cannot be combined with other libraries; give every library a namespace`);
+}
+
+function validateInfo(ns: string, info: LibraryInfo): void {
+  const who = `library '${ns || "(root)"}'`;
+  for (const k of ["title", "vault", "version"] as const) {
+    if (info[k] !== undefined && (typeof info[k] !== "string" || info[k]!.length > 200)) throw new Error(`${who}: ${k} must be a string of at most 200 characters`);
+  }
+  if (info.metadata !== undefined) {
+    if (!info.metadata || typeof info.metadata !== "object" || Array.isArray(info.metadata)) throw new Error(`${who}: metadata must be an object of strings`);
+    for (const [k, v] of Object.entries(info.metadata)) {
+      if (typeof v !== "string" || k.length > 64 || v.length > 500) throw new Error(`${who}: metadata.${k} must be a string (key ≤ 64, value ≤ 500 characters)`);
+    }
+  }
+}
+
+/** Lift the descriptive fields of a config-file library entry into a LibraryInfo, or undefined when there are none. */
+export function infoOf(l: LibraryInfo): LibraryInfo | undefined {
+  const info: LibraryInfo = {};
+  if (l.title !== undefined) info.title = l.title;
+  if (l.vault !== undefined) info.vault = l.vault;
+  if (l.version !== undefined) info.version = l.version;
+  if (l.metadata !== undefined) info.metadata = l.metadata;
+  return Object.keys(info).length ? info : undefined;
 }
 
 export function readConfigFile(file: string): ConfigFile {
@@ -144,9 +186,9 @@ export function readConfigFile(file: string): ConfigFile {
 export function reloadConfigFile(cfg: Config, cliLibs: Library[]): boolean {
   if (!cfg.configFile) return false;
   const cf = readConfigFile(cfg.configFile);
-  const next: Library[] = [...cliLibs, ...cf.libraries.map((l) => ({ namespace: l.namespace, root: l.root ?? "", url: l.url, sha256: l.sha256, noScripts: l.noScripts }))];
+  const next: Library[] = [...cliLibs, ...cf.libraries.map((l) => ({ namespace: l.namespace, root: l.root ?? "", url: l.url, sha256: l.sha256, noScripts: l.noScripts, info: infoOf(l) }))];
   validateLibraries(next);
-  const key = (ls: Library[]) => JSON.stringify(ls.map((l) => [l.namespace, l.root, l.url ?? "", l.sha256 ?? "", !!l.noScripts]));
+  const key = (ls: Library[]) => JSON.stringify(ls.map((l) => [l.namespace, l.root, l.url ?? "", l.sha256 ?? "", !!l.noScripts, l.info ?? null]));
   const changed = key(next) !== key(cfg.libraries) || !!cf.noScripts !== cfg.noScripts || (cf.lint === false) === cfg.lint;
   cfg.libraries.splice(0, cfg.libraries.length, ...next);
   cfg.root = next[0].root;
@@ -219,7 +261,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
   if (root) libs.unshift({ namespace: "", ...parseLibValue(root) });
   if (configFile) {
     const cf = readConfigFile(path.resolve(configFile));
-    libs.push(...cf.libraries.map((l) => ({ namespace: l.namespace, root: l.root ?? "", url: l.url, sha256: l.sha256, noScripts: l.noScripts })));
+    libs.push(...cf.libraries.map((l) => ({ namespace: l.namespace, root: l.root ?? "", url: l.url, sha256: l.sha256, noScripts: l.noScripts, info: infoOf(l) })));
     if (cf.noScripts) noScripts = true;
     if (cf.lint === false) lint = false;
   }

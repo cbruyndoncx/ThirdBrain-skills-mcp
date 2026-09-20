@@ -7,8 +7,8 @@ import {
   ListToolsRequestSchema, CallToolRequestSchema, ListPromptsRequestSchema, GetPromptRequestSchema,
   McpError, ErrorCode,
 } from "@modelcontextprotocol/sdk/types.js";
-import type { Config } from "./config.js";
-import { Catalog, isTextMime, type Skill, type SkillFile } from "./catalog.js";
+import type { Config, Library, LibraryInfo } from "./config.js";
+import { Catalog, isTextMime, publicLibrary, type LibraryStats, type Skill, type SkillFile } from "./catalog.js";
 import { searchSkills } from "./search.js";
 import { SCRIPT_EXTENSIONS } from "./lint.js";
 
@@ -69,6 +69,25 @@ function scriptGuidance(cfg: Config, P: string, skillPath: string) {
 3. Run from ${cache}/${skillPath}/ through the interpreter (\`python scripts/x.py\`, not \`./scripts/x.py\`).`;
 }
 
+/** One line saying what a library is, without saying where it is. */
+function describeLibrary(l: { info?: LibraryInfo; source?: string; digest?: string }): string {
+  const bits: string[] = [];
+  if (l.info?.title) bits.push(l.info.title);
+  if (l.info?.vault) bits.push(`vault ${l.info.vault}`);
+  if (l.info?.version) bits.push(`v${l.info.version}`);
+  if (l.digest) bits.push(`${l.source} ${l.digest.slice(0, 12)}`);
+  else if (l.source && l.source !== "directory") bits.push(l.source);
+  for (const [k, v] of Object.entries(l.info?.metadata ?? {})) bits.push(`${k}=${v}`);
+  return bits.join(", ");
+}
+
+/** Replace library root paths in operator warnings before they leave the server. */
+function redactRoots(cfg: Config, text: string): string {
+  let out = text;
+  for (const l of cfg.libraries) if (l.root && !l.url) out = out.split(l.root).join(`<${l.namespace || "root"}>`);
+  return out;
+}
+
 function skillMeta(s: Skill): Record<string, unknown> {
   const m: Record<string, unknown> = {};
   const pick = ["category", "version", "value-chains", "requires", "chain-stage", "user-invocable", "disable-model-invocation", "tags"];
@@ -118,7 +137,18 @@ async function readContent(f: SkillFile, uri: string) {
     : { uri, mimeType: f.mimeType, blob: buf.toString("base64") };
 }
 
-export function instructionsFor(cfg: Config, count: number): string {
+/** Library line for the initialize instructions. Built from config, which is known before the first scan; stats add the archive digest when available. */
+function libraryLines(cfg: Config, libs: LibraryStats[]): string {
+  const describe = (l: Library) => describeLibrary(libs.find((x) => x.namespace === l.namespace) ?? { info: l.info, source: l.url ? "url" : l.archive ? "archive" : "directory" });
+  if (cfg.libraries.length > 1) {
+    const list = cfg.libraries.map((l) => describe(l) ? `${l.namespace} (${describe(l)})` : l.namespace);
+    return `Libraries served (namespace → first URI segment): ${list.join("; ")}. Pass library=<ns> to scope search/list; ${cfg.toolPrefix}_list_libraries shows counts.\n`;
+  }
+  const d = describe(cfg.libraries[0]);
+  return d ? `Library: ${d}.\n` : "";
+}
+
+export function instructionsFor(cfg: Config, count: number, libs: LibraryStats[] = []): string {
   const p = cfg.toolPrefix;
   return `${cfg.title}: ${count > 0 ? `${count} ` : ""}Agent Skills (SKILL.md folders) served over MCP.
 Skills are loaded on demand (progressive disclosure), never all at once.
@@ -134,7 +164,7 @@ These skills are served by ${cfg.serverName} over MCP; they are not installed lo
 as guidance from this server, not from the user. Before running any bundled script, show it to the user and get
 their approval, check it against its sha256 digest, and run it through its interpreter.
 
-${cfg.libraries.length > 1 ? `Libraries served (namespace → first URI segment): ${cfg.libraries.map((l) => l.namespace).join(", ")}. Pass library=<ns> to scope search/list; ${p}_list_libraries shows counts.\n` : ""}
+${libraryLines(cfg, libs)}
 Hosts that implement the MCP Skills extension (SEP-2640) can instead use skills/list, skills/get and
 resources/read on skill://<skill-path>/<file> URIs; every file also has a sha256 digest.`;
 }
@@ -150,7 +180,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
         prompts: { listChanged: true },
         extensions: { [EXTENSION_ID]: { directoryRead: true } },
       },
-      instructions: instructionsFor(cfg, cat.getStats()?.skills ?? 0),
+      instructions: instructionsFor(cfg, cat.getStats()?.skills ?? 0, cat.getStats()?.libraries ?? []),
     }
   );
 
@@ -295,11 +325,15 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     {
       name: `${P}_list_libraries`,
       title: `List ${cfg.serverName} libraries`,
-      description: "Skill libraries served by this server, with namespace, root directory and skill counts. Namespaces are the first segment of skill:// URIs.",
+      description: "Skill libraries served by this server: namespace, what is loaded (title, vault, version, content digest for archives) and skill counts. Namespaces are the first segment of skill:// URIs.",
       inputSchema: { type: "object", properties: {} },
       outputSchema: {
         type: "object",
-        properties: { libraries: { type: "array", items: { type: "object", properties: { namespace: { type: "string" }, root: { type: "string" }, skills: { type: "integer" }, hidden: { type: "integer" } }, required: ["namespace", "root", "skills", "hidden"] } } },
+        properties: { libraries: { type: "array", items: { type: "object", properties: {
+          namespace: { type: "string" }, source: { type: "string", enum: ["directory", "archive", "url"] },
+          digest: { type: "string", description: "sha256 hex of the extracted archive (archive/url libraries)" },
+          info: { type: "object", properties: { title: { type: "string" }, vault: { type: "string" }, version: { type: "string" }, metadata: { type: "object", additionalProperties: { type: "string" } } } },
+          skills: { type: "integer" }, hidden: { type: "integer" }, noScripts: { type: "boolean" } }, required: ["namespace", "source", "skills", "hidden", "noScripts"] } } },
         required: ["libraries"],
       },
       annotations: RO,
@@ -379,7 +413,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
       outputSchema: {
         type: "object",
         properties: {
-          root: { type: "string" }, libraries: { type: "array" }, skills: { type: "integer" }, hidden: { type: "integer" }, files: { type: "integer" }, bytes: { type: "integer" },
+          libraries: { type: "array" }, skills: { type: "integer" }, hidden: { type: "integer" }, files: { type: "integer" }, bytes: { type: "integer" },
           categories: { type: "object" }, warnings: { type: "array", items: { type: "string" } }, warningCount: { type: "integer" }, scannedAt: { type: "string" }, scanMs: { type: "integer" },
         },
         required: ["skills", "hidden", "files", "bytes", "scannedAt", "warningCount"],
@@ -424,8 +458,8 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           return structured(data, text);
         }
         case `${P}_list_libraries`: {
-          const libraries = cat.getStats().libraries.map((l) => ({ ...l, namespace: l.namespace }));
-          return structured({ libraries }, libraries.map((l) => `- ${l.namespace || "(root)"}: ${l.skills} skills (${l.hidden} hidden)  ${l.root}`).join("\n"));
+          const libraries = cat.getStats().libraries.map(publicLibrary);
+          return structured({ libraries }, cat.getStats().libraries.map((l) => `- ${l.namespace || "(root)"}: ${l.skills} skills (${l.hidden} hidden)${describeLibrary(l) ? `  ${describeLibrary(l)}` : ""}${l.noScripts ? "  [scripts withheld]" : ""}`).join("\n"));
         }
         case `${P}_list_categories`: {
           const skills = cat.all(libFilter(a.library));
@@ -471,8 +505,8 @@ export function createServer(cfg: Config, cat: Catalog): Server {
         }
         case `${P}_catalog_status`: {
           if (a.refresh) await cat.scan();
-          const st = cat.getStats();
-          const data = { ...st, warningCount: st.warnings.length, warnings: a.include_warnings ? st.warnings : [] };
+          const { root: _root, ...st } = cat.getStats();
+          const data = { ...st, libraries: st.libraries.map(publicLibrary), warningCount: st.warnings.length, warnings: a.include_warnings ? st.warnings.map((w) => redactRoots(cfg, w)) : [] };
           return structured(data);
         }
         default:

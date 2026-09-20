@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { z } from "zod";
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
 import { connected, libA, libB } from "./helpers.js";
 
 const ARGS = ["--lib", `a=${libA}`, "--lib", `b=${libB}`, "--name", "multi"];
@@ -9,7 +12,7 @@ test("initialize: extension capability, instructions mention libraries", async (
   const { client, close } = await connected(ARGS);
   try {
     assert.deepEqual(client.getServerCapabilities()!.extensions, { "io.modelcontextprotocol/skills": { directoryRead: true } });
-    assert.match(client.getInstructions()!, /Libraries served.*a, b/);
+    assert.match(client.getInstructions()!, /Libraries served.*a; b/);
     assert.match(client.getInstructions()!, /not installed locally/);
     assert.doesNotMatch(client.getInstructions()!, /as if the skill were installed/);
     assert.equal(client.getServerVersion()!.name, "multi");
@@ -68,7 +71,11 @@ test("tools: prefix, outputSchema, structuredContent, library filter, ambiguity"
     assert.equal((ok.structuredContent as any).rootOnDisk, undefined);
     assert.doesNotMatch((ok.content as any)[0].text, new RegExp(libB.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "no absolute paths in get_skill text");
     const libs = await client.callTool({ name: "multi_list_libraries", arguments: {} });
-    assert.deepEqual((libs.structuredContent as any).libraries.map((l: any) => l.namespace), ["a", "b"]);
+    assert.deepEqual((libs.structuredContent as any).libraries.map((l: any) => [l.namespace, l.source, l.root]), [["a", "directory", undefined], ["b", "directory", undefined]]);
+    assert.doesNotMatch(JSON.stringify(libs), /fixtures/, "no library path in list_libraries");
+    const status = await client.callTool({ name: "multi_catalog_status", arguments: { include_warnings: true } });
+    assert.equal((status.structuredContent as any).root, undefined);
+    assert.doesNotMatch(JSON.stringify(status), /fixtures/, "no library path in catalog_status");
     const ls = await client.callTool({ name: "multi_list_skills", arguments: { limit: 3 } });
     const lsc = ls.structuredContent as any;
     assert.equal(lsc.skills.length, 3); assert.ok(lsc.nextCursor);
@@ -86,5 +93,23 @@ test("prompt use-skill inlines the skill body", async () => {
     assert.match((p.messages[0].content as any).text, /<skill name="alpha" source="multi">[\s\S]*Body A/);
     assert.match((p.messages[0].content as any).text, /Source: multi \(MCP-served skill/);
     assert.doesNotMatch((p.messages[0].content as any).text, /Bundled scripts/, "no script guidance without scripts");
+  } finally { await close(); }
+});
+test("library info from the config file is shown instead of the path", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "cfg-"));
+  const cfgPath = path.join(tmp, "skills.json");
+  await fs.writeFile(cfgPath, JSON.stringify({ libraries: [
+    { namespace: "a", root: libA, title: "Library A", vault: "vault-a", version: "2026.09", metadata: { channel: "stable" } },
+    { namespace: "b", root: libB },
+  ] }));
+  const { client, close } = await connected(["--config", cfgPath, "--name", "multi"]);
+  try {
+    assert.match(client.getInstructions()!, /a \(Library A, vault vault-a, v2026\.09, channel=stable\); b\./);
+    const libs = await client.callTool({ name: "multi_list_libraries", arguments: {} });
+    const [a, b] = (libs.structuredContent as any).libraries;
+    assert.deepEqual(a.info, { title: "Library A", vault: "vault-a", version: "2026.09", metadata: { channel: "stable" } });
+    assert.equal(b.info, undefined);
+    assert.match((libs.content as any)[0].text, /- a: 2 skills \(0 hidden\)  Library A, vault vault-a, v2026\.09, channel=stable/);
+    assert.doesNotMatch(JSON.stringify(libs) + client.getInstructions(), /fixtures/, "no library path anywhere");
   } finally { await close(); }
 });

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import type { Config, Library } from "./config.js";
+import type { Config, LibraryInfo, Library } from "./config.js";
 
 interface Discovered { skillPath: string; abs: string; library: string }
 import { splitFrontmatter, coerceString, coerceList } from "./frontmatter.js";
@@ -46,9 +46,29 @@ export interface Skill {
   skillMdMtimeMs: number;
 }
 
+/** Per-library figures. `root` is for the operator (logs, --stats); `publicLibrary()` is what goes over MCP. */
+export interface LibraryStats {
+  namespace: string;
+  root: string;
+  /** Where the content comes from: a plain directory, a local .zip, or an https .zip. */
+  source: "directory" | "archive" | "url";
+  /** sha256 hex of the archive currently extracted (archive and url libraries only). */
+  digest?: string;
+  info?: LibraryInfo;
+  skills: number;
+  hidden: number;
+  noScripts: boolean;
+}
+
+/** The client-facing view of a library: everything in LibraryStats except where it lives. */
+export function publicLibrary(l: LibraryStats): Omit<LibraryStats, "root"> {
+  const { root: _root, ...rest } = l;
+  return rest;
+}
+
 export interface CatalogStats {
   root: string;
-  libraries: { namespace: string; root: string; skills: number; hidden: number; noScripts: boolean }[];
+  libraries: LibraryStats[];
   flaggedSkills: number;
   scriptsWithheld: number;
   /** Skills not served because they bundle an archive file. */
@@ -232,7 +252,14 @@ export class Catalog {
     this.hidden = nextHidden;
     const categories: Record<string, number> = {};
     let files = 0, bytes = 0;
-    const perLib = new Map(this.cfg.libraries.map((l) => [l.namespace, { namespace: l.namespace, root: l.root, skills: 0, hidden: 0, noScripts: !!(l.noScripts || this.cfg.noScripts) }]));
+    const perLib = new Map<string, LibraryStats>(this.cfg.libraries.map((l) => {
+      const source = l.url ? "url" : l.archive ? "archive" : "directory";
+      const digest = l.url ? this.remoteState.get(l.url)?.digest : l.archive ? this.archiveState.get(l.root)?.digest : undefined;
+      const st: LibraryStats = { namespace: l.namespace, root: l.root, source, skills: 0, hidden: 0, noScripts: !!(l.noScripts || this.cfg.noScripts) };
+      if (digest) st.digest = digest;
+      if (l.info) st.info = l.info;
+      return [l.namespace, st];
+    }));
     let flaggedSkills = 0, scriptsWithheld = 0;
     for (const s of next.values()) {
       categories[s.category] = (categories[s.category] ?? 0) + 1;

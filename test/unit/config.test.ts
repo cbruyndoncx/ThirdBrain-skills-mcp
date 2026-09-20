@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
 import { cfgFor, libA, libB } from "./helpers.js";
+import { loadConfig, reloadConfigFile } from "../../src/config.js";
 
 test("single --root → one un-namespaced library, default name/prefix", () => {
   const c = cfgFor(["--root", libA]);
@@ -33,4 +37,20 @@ test("SKILLS_LIBS env is honoured", () => {
     const c = cfgFor([]);
     assert.deepEqual(c.libraries.map((l) => l.namespace), ["x", "y"]);
   } finally { delete process.env.SKILLS_LIBS; }
+});
+test("config file: library info loads, a version bump counts as a change, bad metadata is rejected", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "cfg-"));
+  const cfgPath = path.join(tmp, "skills.json");
+  const write = (libs: unknown[]) => fs.writeFile(cfgPath, JSON.stringify({ libraries: libs }));
+  await write([{ namespace: "a", root: libA, vault: "v", version: "1" }]);
+  const cfg = loadConfig(["--config", cfgPath]);
+  assert.deepEqual(cfg.libraries[0].info, { vault: "v", version: "1" });
+  assert.equal(reloadConfigFile(cfg, []), false, "unchanged");
+  await write([{ namespace: "a", root: libA, vault: "v", version: "2" }]);
+  assert.equal(reloadConfigFile(cfg, []), true, "version bump is a change");
+  assert.equal(cfg.libraries[0].info?.version, "2");
+  await write([{ namespace: "a", root: libA, metadata: { n: 5 } }]);
+  assert.throws(() => reloadConfigFile(cfg, []), /metadata\.n must be a string/);
+  await write([{ namespace: "a", root: libA, version: 3 }]);
+  assert.throws(() => reloadConfigFile(cfg, []), /version must be a string/);
 });
