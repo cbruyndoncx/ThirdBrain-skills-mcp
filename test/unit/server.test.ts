@@ -71,7 +71,7 @@ test("tools: prefix, outputSchema, structuredContent, library filter, ambiguity"
     assert.equal((ok.structuredContent as any).rootOnDisk, undefined);
     assert.doesNotMatch((ok.content as any)[0].text, new RegExp(libB.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "no absolute paths in get_skill text");
     const libs = await client.callTool({ name: "multi_list_libraries", arguments: {} });
-    assert.deepEqual((libs.structuredContent as any).libraries.map((l: any) => [l.namespace, l.source, l.root]), [["a", "directory", undefined], ["b", "directory", undefined]]);
+    assert.deepEqual((libs.structuredContent as any).libraries.map((l: any) => [l.namespace, l.kind, l.root]), [["a", "directory", undefined], ["b", "directory", undefined]]);
     assert.doesNotMatch(JSON.stringify(libs), /fixtures/, "no library path in list_libraries");
     const status = await client.callTool({ name: "multi_catalog_status", arguments: { include_warnings: true } });
     assert.equal((status.structuredContent as any).root, undefined);
@@ -99,17 +99,17 @@ test("library info from the config file is shown instead of the path", async () 
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "cfg-"));
   const cfgPath = path.join(tmp, "skills.json");
   await fs.writeFile(cfgPath, JSON.stringify({ libraries: [
-    { namespace: "a", root: libA, title: "Library A", vault: "vault-a", version: "2026.09", metadata: { channel: "stable" } },
+    { namespace: "a", root: libA, title: "Library A", source: "vault-a", version: "2026.09", metadata: { channel: "stable" } },
     { namespace: "b", root: libB },
   ] }));
   const { client, close } = await connected(["--config", cfgPath, "--name", "multi"]);
   try {
-    assert.match(client.getInstructions()!, /a \(Library A, vault vault-a, v2026\.09, channel=stable\); b\./);
+    assert.match(client.getInstructions()!, /a \(Library A, from vault-a, v2026\.09, channel=stable\); b\./);
     const libs = await client.callTool({ name: "multi_list_libraries", arguments: {} });
     const [a, b] = (libs.structuredContent as any).libraries;
-    assert.deepEqual(a.info, { title: "Library A", vault: "vault-a", version: "2026.09", metadata: { channel: "stable" } });
+    assert.deepEqual(a.info, { title: "Library A", source: "vault-a", version: "2026.09", metadata: { channel: "stable" } });
     assert.equal(b.info, undefined);
-    assert.match((libs.content as any)[0].text, /- a: 2 skills \(0 hidden\)  Library A, vault vault-a, v2026\.09, channel=stable/);
+    assert.match((libs.content as any)[0].text, /- a: 2 skills \(0 hidden\)  Library A, from vault-a, v2026\.09, channel=stable/);
     assert.doesNotMatch(JSON.stringify(libs) + client.getInstructions(), /fixtures/, "no library path anywhere");
   } finally { await close(); }
 });

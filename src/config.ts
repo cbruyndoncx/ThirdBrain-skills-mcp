@@ -25,13 +25,13 @@ export interface Library {
 
 /**
  * What a client may learn about a library. Paths are never shown over MCP, so this is how an
- * operator says what is loaded: the vault it comes from, its version, and anything else useful.
+ * operator says what is loaded: where it comes from, its version, and anything else useful.
  */
 export interface LibraryInfo {
   /** Human title, e.g. "BOB – ThirdBrain Business Operating Brain". */
   title?: string;
-  /** Name of the vault (or repository) the library is exported from, e.g. "brncx-skills". */
-  vault?: string;
+  /** Where the content comes from, e.g. the vault, repository or team that publishes it: "brncx-skills". */
+  source?: string;
   /** Version of the library content, e.g. "2026.09" or a git tag. */
   version?: string;
   /** Free-form string pairs, e.g. {"maintainer": "...", "channel": "stable"}. */
@@ -97,7 +97,7 @@ const HELP = `skills-mcp — serve a directory of Agent Skills (SKILL.md folders
 usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefix PREFIX] [--title TITLE] [--http PORT] [--show-disabled] [--stats]
        skills-mcp pull --help        sync skills from any SEP-2640 server to disk
 
-  --config FILE      JSON {libraries:[{namespace,root|url,noScripts?,title?,vault?,version?,metadata?}],noScripts?,lint?}
+  --config FILE      JSON {libraries:[{namespace,root|url,noScripts?,title?,source?,version?,metadata?}],noScripts?,lint?}
                      re-read on rescan/SIGHUP                                        env SKILLS_CONFIG
   --no-scripts       withhold executable files (.sh .py .js .ps1 ...) from all manifests      env SKILLS_NO_SCRIPTS=true
   --no-lint          disable the scan-time risk linter                                        env SKILLS_LINT=false
@@ -147,7 +147,7 @@ export function validateLibraries(libs: Library[]): void {
 
 function validateInfo(ns: string, info: LibraryInfo): void {
   const who = `library '${ns || "(root)"}'`;
-  for (const k of ["title", "vault", "version"] as const) {
+  for (const k of ["title", "source", "version"] as const) {
     if (info[k] !== undefined && (typeof info[k] !== "string" || info[k]!.length > 200)) throw new Error(`${who}: ${k} must be a string of at most 200 characters`);
   }
   if (info.metadata !== undefined) {
@@ -162,7 +162,7 @@ function validateInfo(ns: string, info: LibraryInfo): void {
 export function infoOf(l: LibraryInfo): LibraryInfo | undefined {
   const info: LibraryInfo = {};
   if (l.title !== undefined) info.title = l.title;
-  if (l.vault !== undefined) info.vault = l.vault;
+  if (l.source !== undefined) info.source = l.source;
   if (l.version !== undefined) info.version = l.version;
   if (l.metadata !== undefined) info.metadata = l.metadata;
   return Object.keys(info).length ? info : undefined;

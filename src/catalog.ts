@@ -50,8 +50,8 @@ export interface Skill {
 export interface LibraryStats {
   namespace: string;
   root: string;
-  /** Where the content comes from: a plain directory, a local .zip, or an https .zip. */
-  source: "directory" | "archive" | "url";
+  /** How the content is loaded: a plain directory, a local .zip, or an https .zip. */
+  kind: "directory" | "archive" | "url";
   /** sha256 hex of the archive currently extracted (archive and url libraries only). */
   digest?: string;
   info?: LibraryInfo;
@@ -253,9 +253,9 @@ export class Catalog {
     const categories: Record<string, number> = {};
     let files = 0, bytes = 0;
     const perLib = new Map<string, LibraryStats>(this.cfg.libraries.map((l) => {
-      const source = l.url ? "url" : l.archive ? "archive" : "directory";
+      const kind = l.url ? "url" : l.archive ? "archive" : "directory";
       const digest = l.url ? this.remoteState.get(l.url)?.digest : l.archive ? this.archiveState.get(l.root)?.digest : undefined;
-      const st: LibraryStats = { namespace: l.namespace, root: l.root, source, skills: 0, hidden: 0, noScripts: !!(l.noScripts || this.cfg.noScripts) };
+      const st: LibraryStats = { namespace: l.namespace, root: l.root, kind, skills: 0, hidden: 0, noScripts: !!(l.noScripts || this.cfg.noScripts) };
       if (digest) st.digest = digest;
       if (l.info) st.info = l.info;
       return [l.namespace, st];

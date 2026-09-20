@@ -42,11 +42,11 @@ test("config file: library info loads, a version bump counts as a change, bad me
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "cfg-"));
   const cfgPath = path.join(tmp, "skills.json");
   const write = (libs: unknown[]) => fs.writeFile(cfgPath, JSON.stringify({ libraries: libs }));
-  await write([{ namespace: "a", root: libA, vault: "v", version: "1" }]);
+  await write([{ namespace: "a", root: libA, source: "v", version: "1" }]);
   const cfg = loadConfig(["--config", cfgPath]);
-  assert.deepEqual(cfg.libraries[0].info, { vault: "v", version: "1" });
+  assert.deepEqual(cfg.libraries[0].info, { source: "v", version: "1" });
   assert.equal(reloadConfigFile(cfg, []), false, "unchanged");
-  await write([{ namespace: "a", root: libA, vault: "v", version: "2" }]);
+  await write([{ namespace: "a", root: libA, source: "v", version: "2" }]);
   assert.equal(reloadConfigFile(cfg, []), true, "version bump is a change");
   assert.equal(cfg.libraries[0].info?.version, "2");
   await write([{ namespace: "a", root: libA, metadata: { n: 5 } }]);

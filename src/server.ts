@@ -70,13 +70,13 @@ function scriptGuidance(cfg: Config, P: string, skillPath: string) {
 }
 
 /** One line saying what a library is, without saying where it is. */
-function describeLibrary(l: { info?: LibraryInfo; source?: string; digest?: string }): string {
+function describeLibrary(l: { info?: LibraryInfo; kind?: string; digest?: string }): string {
   const bits: string[] = [];
   if (l.info?.title) bits.push(l.info.title);
-  if (l.info?.vault) bits.push(`vault ${l.info.vault}`);
+  if (l.info?.source) bits.push(`from ${l.info.source}`);
   if (l.info?.version) bits.push(`v${l.info.version}`);
-  if (l.digest) bits.push(`${l.source} ${l.digest.slice(0, 12)}`);
-  else if (l.source && l.source !== "directory") bits.push(l.source);
+  if (l.digest) bits.push(`${l.kind} ${l.digest.slice(0, 12)}`);
+  else if (l.kind && l.kind !== "directory") bits.push(l.kind);
   for (const [k, v] of Object.entries(l.info?.metadata ?? {})) bits.push(`${k}=${v}`);
   return bits.join(", ");
 }
@@ -139,7 +139,7 @@ async function readContent(f: SkillFile, uri: string) {
 
 /** Library line for the initialize instructions. Built from config, which is known before the first scan; stats add the archive digest when available. */
 function libraryLines(cfg: Config, libs: LibraryStats[]): string {
-  const describe = (l: Library) => describeLibrary(libs.find((x) => x.namespace === l.namespace) ?? { info: l.info, source: l.url ? "url" : l.archive ? "archive" : "directory" });
+  const describe = (l: Library) => describeLibrary(libs.find((x) => x.namespace === l.namespace) ?? { info: l.info, kind: l.url ? "url" : l.archive ? "archive" : "directory" });
   if (cfg.libraries.length > 1) {
     const list = cfg.libraries.map((l) => describe(l) ? `${l.namespace} (${describe(l)})` : l.namespace);
     return `Libraries served (namespace → first URI segment): ${list.join("; ")}. Pass library=<ns> to scope search/list; ${cfg.toolPrefix}_list_libraries shows counts.\n`;
@@ -325,15 +325,15 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     {
       name: `${P}_list_libraries`,
       title: `List ${cfg.serverName} libraries`,
-      description: "Skill libraries served by this server: namespace, what is loaded (title, vault, version, content digest for archives) and skill counts. Namespaces are the first segment of skill:// URIs.",
+      description: "Skill libraries served by this server: namespace, what is loaded (title, source, version, content digest for archives) and skill counts. Namespaces are the first segment of skill:// URIs.",
       inputSchema: { type: "object", properties: {} },
       outputSchema: {
         type: "object",
         properties: { libraries: { type: "array", items: { type: "object", properties: {
-          namespace: { type: "string" }, source: { type: "string", enum: ["directory", "archive", "url"] },
+          namespace: { type: "string" }, kind: { type: "string", enum: ["directory", "archive", "url"], description: "How the library is loaded" },
           digest: { type: "string", description: "sha256 hex of the extracted archive (archive/url libraries)" },
-          info: { type: "object", properties: { title: { type: "string" }, vault: { type: "string" }, version: { type: "string" }, metadata: { type: "object", additionalProperties: { type: "string" } } } },
-          skills: { type: "integer" }, hidden: { type: "integer" }, noScripts: { type: "boolean" } }, required: ["namespace", "source", "skills", "hidden", "noScripts"] } } },
+          info: { type: "object", properties: { title: { type: "string" }, source: { type: "string", description: "Vault, repository or team the library comes from" }, version: { type: "string" }, metadata: { type: "object", additionalProperties: { type: "string" } } } },
+          skills: { type: "integer" }, hidden: { type: "integer" }, noScripts: { type: "boolean" } }, required: ["namespace", "kind", "skills", "hidden", "noScripts"] } } },
         required: ["libraries"],
       },
       annotations: RO,
