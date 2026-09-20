@@ -34,7 +34,7 @@ git clone https://github.com/cbruyndoncx/ThirdBrain-skills-mcp.git
 cd ThirdBrain-skills-mcp
 npm install
 npm run build
-npm run test:unit   # 34 unit tests (in-memory MCP client, fixtures under test/fixtures)
+npm run test:unit   # 66 unit tests (in-memory MCP client, fixtures under test/fixtures)
 npm test            # smoke test against the BOB library
 npm run test:gbl    # same test against the GBL library
 npm run test:nested # nested-path fixture (skill://acme/billing/refunds/...)
