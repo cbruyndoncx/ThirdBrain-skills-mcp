@@ -1,6 +1,6 @@
 {
   "name": "thirdbrain-skills-mcp",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "MCP server that serves the ThirdBrain BOB skill library over MCP (SEP-2640 skills extension + discovery tools)",
   "main": "index.js",
   "scripts": {
