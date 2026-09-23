@@ -24,6 +24,8 @@ export interface PullOptions {
   /** Destination directory; each skill is written to <to>/<skill name>/ (or <to>/<skill path>/ with keepPath). */
   to: string;
   keepPath: boolean;
+  /** Also pull every skill the selected ones declare as a required runtime dependency, transitively, from the same library. */
+  withDeps?: boolean;
   force: boolean;
   /** Update an existing folder in place: keep files whose sha256 matches, fetch the rest, delete files not in the manifest. */
   sync: boolean;
@@ -35,9 +37,19 @@ const SkillEntry = z.object({
   uri: z.string(),
   frontmatter: z.record(z.string(), z.unknown()),
   resources: z.union([z.literal("dynamic"), z.array(z.object({ uri: z.string(), digest: z.string(), size: z.number().int().nonnegative() }))]),
+  _meta: z.record(z.string(), z.unknown()).optional(),
 });
 const SkillsListResult = z.object({ skills: z.array(SkillEntry), nextCursor: z.string().optional() }).passthrough();
 type SkillEntryT = z.infer<typeof SkillEntry>;
+
+const DEPS_KEY = "io.modelcontextprotocol.skills/dependencies";
+const LIBRARY_KEY = "io.modelcontextprotocol.skills/library";
+
+/** Required runtime dependencies a server declares for a skill entry (names, same library). */
+export function requiredDepsOf(e: { _meta?: Record<string, unknown> }): string[] {
+  const d = e._meta?.[DEPS_KEY] as { required?: unknown } | undefined;
+  return Array.isArray(d?.required) ? d!.required.filter((x): x is string => typeof x === "string" && /^[a-z0-9][a-z0-9-]*$/i.test(x)) : [];
+}
 
 export function skillPathOf(uri: string): string {
   return uri.replace(/^skill:\/\//, "").replace(/\/SKILL\.md$/, "").split("/").map(decodeURIComponent).join("/");
@@ -85,6 +97,7 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
       }
     }
     if (!selected.length) throw new Error("nothing selected: give skill names, or --all");
+    if (o.withDeps && !o.all) selected = await withDependencies(client, entries, selected, o.log);
 
     let written = 0, skipped = 0;
     const done: string[] = [];
@@ -151,7 +164,42 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
   }
 }
 
-const PULL_HELP = `skills-mcp pull [skill ...] (--url URL | --command CMD [ARGS...]) --to DIR [--all] [--list] [--keep-path] [--sync] [--force] [--dry-run]
+/**
+ * Add the transitive required-dependency closure of the selected skills. A dependency is looked
+ * up in the same library: the sibling skill path first, then an entry of the same library with that
+ * name, then skills/get on the sibling URI (hidden skills are not listed but still served).
+ * Cross-library dependencies are not supported; an unresolvable one is an error, since the
+ * skill's scripts would fail without it.
+ */
+async function withDependencies(client: Client, entries: SkillEntryT[], selected: SkillEntryT[], log: (m: string) => void): Promise<SkillEntryT[]> {
+  const out = [...selected];
+  const seen = new Set(out.map((e) => e.uri));
+  const queue = [...out];
+  while (queue.length) {
+    const e = queue.shift()!;
+    const sp = skillPathOf(e.uri);
+    const parent = sp.split("/").slice(0, -1).join("/");
+    const lib = e._meta?.[LIBRARY_KEY];
+    for (const dep of requiredDepsOf(e)) {
+      const sibling = parent ? `${parent}/${dep}` : dep;
+      let hit = entries.find((x) => skillPathOf(x.uri) === sibling)
+        ?? entries.find((x) => lib !== undefined && x._meta?.[LIBRARY_KEY] === lib && (x.frontmatter.name === dep || skillPathOf(x.uri).split("/").pop() === dep));
+      if (!hit) {
+        const uri = `skill://${sibling.split("/").map(encodeURIComponent).join("/")}/SKILL.md`;
+        hit = await client.request({ method: "skills/get", params: { uri } }, SkillEntry).catch(() => undefined);
+      }
+      if (!hit) throw new Error(`${sp} declares runtime dependency '${dep}', which the server does not serve in the same library; pull without --with-deps to fetch the skill alone`);
+      if (seen.has(hit.uri)) continue;
+      seen.add(hit.uri);
+      log(`deps  ${sp} → ${skillPathOf(hit.uri)}`);
+      out.push(hit);
+      queue.push(hit);
+    }
+  }
+  return out;
+}
+
+const PULL_HELP = `skills-mcp pull [skill ...] (--url URL | --command CMD [ARGS...]) --to DIR [--all] [--list] [--keep-path] [--with-deps] [--sync] [--force] [--dry-run]
 
   Sync skills from any SEP-2640 server into DIR/<skill-name>/ with sha256 verification.
   --url URL          Streamable HTTP endpoint, e.g. http://127.0.0.1:3939/mcp
@@ -160,6 +208,9 @@ const PULL_HELP = `skills-mcp pull [skill ...] (--url URL | --command CMD [ARGS.
   --all              pull every skill the server lists
   --list             only list skills on the server
   --keep-path        use the full skill path (incl. namespace) as the folder name
+  --with-deps        also pull the skills each selected skill declares as a required runtime
+                     dependency (transitively, same library), as its siblings; running a skill's
+                     scripts runs theirs too, so approve the whole closure
   --sync             update existing skill folders in place: keep files whose sha256 already
                      matches (no network read), fetch the rest, delete files not in the skill
   --force            overwrite existing skill folders
@@ -201,6 +252,7 @@ export function parsePullArgs(argv: string[]): PullOptions {
     else if (a === "--all") o.all = true;
     else if (a === "--list") o.list = true;
     else if (a === "--keep-path") o.keepPath = true;
+    else if (a === "--with-deps") o.withDeps = true;
     else if (a === "--force") o.force = true;
     else if (a === "--sync") o.sync = true;
     else if (a === "--dry-run") o.dryRun = true;

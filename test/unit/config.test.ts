@@ -54,3 +54,24 @@ test("config file: library info loads, a version bump counts as a change, bad me
   await write([{ namespace: "a", root: libA, version: 3 }]);
   assert.throws(() => reloadConfigFile(cfg, []), /version must be a string/);
 });
+test("SKILLS_ROOT is not read: it is the skills' own contract, a host may export it for them", () => {
+  process.env.SKILLS_ROOT = "/anything";
+  try {
+    const c = cfgFor(["--lib", `bob=${libA}`]);
+    assert.deepEqual(c.libraries.map((l) => l.namespace), ["bob"], "only bob, no un-namespaced library from SKILLS_ROOT");
+    assert.throws(() => cfgFor([]), /SKILLS_MCP_ROOT/, "SKILLS_ROOT alone does not configure a library");
+  } finally { delete process.env.SKILLS_ROOT; }
+});
+test("SKILLS_MCP_ROOT serves an un-namespaced library; BOB_SKILLS_ROOT is a deprecated alias", () => {
+  process.env.SKILLS_MCP_ROOT = libB;
+  try {
+    const c = cfgFor([]);
+    assert.equal(c.libraries.length, 1);
+    assert.equal(c.libraries[0].namespace, "");
+    assert.equal(c.libraries[0].root, libB);
+  } finally { delete process.env.SKILLS_MCP_ROOT; }
+  process.env.BOB_SKILLS_ROOT = libA;
+  try {
+    assert.equal(cfgFor([]).libraries[0].root, libA);
+  } finally { delete process.env.BOB_SKILLS_ROOT; }
+});

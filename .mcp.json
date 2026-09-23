@@ -2,9 +2,8 @@
   "mcpServers": {
     "skills": {
       "command": "node",
-      "args": ["/home/cb/projects/dev/bob-skills-mcp/dist/index.js",
-               "--lib", "bob=/mnt/d/OBS/brncx-skills/00-CORE/Agents/skills",
-               "--lib", "gbl=/mnt/d/OBS/gbl-skills/00-CORE/Agents/skills"]
+      "args": ["${PWD}/dist/index.js",
+               "--lib", "bob=${BOB_VAULT:-/mnt/c/users/bruyn/documents/brncx-skills}"]
     }
   }
 }

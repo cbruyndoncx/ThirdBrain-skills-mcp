@@ -15,17 +15,109 @@ skills folder.
 | Surface | Purpose |
 |---|---|
 | `capabilities.extensions["io.modelcontextprotocol/skills"]` | Declares the extension (`directoryRead: true`). |
-| `skills/list` (paginated) / `skills/get` | Skill entries: `uri`, verbatim `frontmatter`, `resources[]` with `sha256` digests and sizes. |
-| `resources/list` | One `text/markdown` resource per skill (`skill://<name>/SKILL.md`), extra frontmatter under `_meta` with the `io.modelcontextprotocol.skills/` prefix. |
-| `resources/templates/list` | `skill://{+skillPath}/SKILL.md` and `skill://{+skillPath}/{+path}`. |
-| `resources/read` | Any bundled file (text, or base64 blob for binaries). |
+| `skills/list` (paginated) / `skills/get` | Skill entries: `uri`, verbatim `frontmatter`, `resources[]` with `sha256` digests and sizes, and `_meta` with `io.modelcontextprotocol.skills/dependencies` (`{required, optional}`: other skills this one runs code from, see [Runtime dependencies](#runtime-dependencies)) and `.../library`. |
+| `resources/list` | One `text/markdown` resource per skill (`skill://<name>/SKILL.md`), extra frontmatter under `_meta` with the `io.modelcontextprotocol.skills/` prefix. Plus one per served playbook (`playbook://<ns>/<name>`) and value chain (`value-chain://<ns>/<id>`), `_meta` under `io.thirdbrain.vault/`. |
+| `resources/templates/list` | `skill://{+skillPath}/SKILL.md` and `skill://{+skillPath}/{+path}`; `playbook://{+playbookPath}`, `playbook://{+playbookPath}/{+file}` and `value-chain://{+library}/{id}` when served. |
+| `resources/read` | Any bundled file (text, or base64 blob for binaries); a playbook note or an attachment embedded by it; a value chain rendered as a markdown stage table. |
 | `resources/directory/read` | Children of a skill directory (`inode/directory`). |
 | `notifications/resources/list_changed` | Sent after a rescan detects changes. |
-| Tools | `<prefix>_search_skills`, `_list_skills`, `_list_libraries`, `_list_categories`, `_get_skill`, `_read_skill_file`, `_catalog_status`. All declare `outputSchema` and return `structuredContent`; search/list/categories take a `library` filter. |
-| Prompt | `use-skill(skill, task?)` injects a skill's instructions into the conversation. |
+| Tools | `<prefix>_search_skills`, `_list_skills`, `_list_libraries`, `_list_categories`, `_get_skill`, `_read_skill_file`, `_catalog_status`. All declare `outputSchema` and return `structuredContent`; search/list/categories take a `library` filter. When a library sits in a vault: `_list_playbooks`, `_get_playbook`, `_list_value_chains`, `_get_value_chain` (see [Playbooks and value chains](#playbooks-and-value-chains)). |
+| Prompts | `use-skill(skill, task?)` injects a skill's instructions into the conversation; `run-playbook(playbook, inputs?)` injects the `playbook-runner` skill plus a playbook. |
 
 The agent flow is progressive disclosure: **search → get_skill → read_skill_file**. Only the
 skill you pick enters context.
+
+## Playbooks and value chains
+
+A ThirdBrain vault keeps two more things next to its skills: **playbooks** (multi-step workflows
+that chain skills into an outcome: trigger → numbered AGENT/HUMAN steps → outcome; only the
+vault-shipped ones under `00-CORE/Playbooks/` are served) and **value chains** (end-to-end business journeys such as `lead-to-cash` with ordered stages, to which skills
+and playbooks are mapped). The server serves both when the information is present, and nothing
+otherwise: the tools, prompt and resource templates only appear when at least one library serves
+them, and hosts are told through `tools/list_changed` after the first scan.
+
+**The root is the boundary.** The server reads only what is inside the directory, zip or URL you
+give it, never folders above or beside it. So `--lib bob=<vault>/00-CORE/Agents/skills` serves
+skills only, as before; to serve playbooks and value chains, give the vault root (or a release zip
+of it). The layout is recognised from what is inside the root, so the same pack works as a
+checked-out folder, a local zip, or a GitHub release asset:
+
+| Root given (directory, zip, or URL) | Skills root | Vault root |
+|---|---|---|
+| A skills folder (any folder without the markers below) | as given | none: skills only |
+| `<vault>` (contains `00-CORE/Agents/skills`) | that subfolder | as given |
+| One wrapper folder containing `00-CORE/Agents/skills` (GitHub release zips are shaped this way) | inside the wrapper | the wrapper |
+| Anything else that holds `00-CORE/Playbooks` or a `value-chains.md` within four levels | as given | as given |
+
+`--vault NS=DIR` or `"vault"` in the config file names a vault directory explicitly, the one case
+where content outside the root is served, by your choice; `"vault": false` turns the extras off
+for one library. Inside the vault root only these locations are read:
+
+| Information | Source | Served as |
+|---|---|---|
+| Playbooks | `type: playbook` notes under `00-CORE/Playbooks/` only, the vault-shipped library. Company, personal and client playbooks (`20-COMPANY/03-PROCESSES/Playbooks/`, `10-ME/Playbooks/`, `30-CLIENTS/<id>/Playbooks/`) are private and never served; notes found in the first two are counted in a `catalog_status` warning so the operator knows. Recursive; `_archive/` and `UPGRADE/` skipped; `AGENTS.md`, `CLAUDE.md`, `_local.md` ignored. | `playbook://<ns>/<file stem>`; files embedded with `![[name]]` from the same folder (sequence diagrams) as `playbook://<ns>/<stem>/<file>` |
+| Value chains | `20-COMPANY/03-PROCESSES/value-chains.md`, the canonical file: `### <id>` with **SME Label**, **Description**, **Stages** fields (bulleted `- **Stages:** …` or not), plus the `## Cross-Chain: …` / `## Meta-Chain: …` sections and the ids in its "Valid chain IDs" list that have no `###` block, which are served as **buckets** (unstaged groups such as `operating-controls` and `infrastructure`: no stages, no gaps). Else `VALUE-CHAINS.md` at the root, else any `value-chains.md` (case-insensitive) found by walking. Without one, chains are **derived** from the `value-chains` / `chain-stage` frontmatter of skills and the `value-chain` / `chain-coverage` frontmatter of playbooks. | `value-chain://<ns>/<id>` |
+
+Paths never leave the server: `vaultPath` in playbook output is relative to the vault root, and
+archive extraction directories are not shown.
+
+**How steps are read.** Steps are the numbered items of the `## Steps` section, in the
+`playbook-runner` grammar: `N (countdown). head → action (AGENT|HUMAN[ — note])`, where the head
+is `skill`, `skill (route)`, `[[Playbook]]` or `script:file.py`, and bold or code decoration around
+it is ignored. An item runs over its indented continuation lines up to the next item or heading
+(numbered lines inside code fences or indented deeper are not items). The actor is the
+parenthesis ending the item's first paragraph (`(AGENT)`, `(HUMAN + AGENT)`, `(HUMAN, 5 min)`,
+`(HUMAN decides, AGENT drafts)`), else the first one inside it, else the one ending a later
+paragraph. A step's skill is the head when it names a skill, else the first **served** skill the
+step links to — `[[skill]]`, `[[skill/SKILL.md|…]]`, `{skills.root}/skill/…` or `skill/scripts/…`;
+links to other notes (playbooks) are not skills, and embeds (`![[…]]`) are ignored. Further linked
+skills are listed as `mentions`. A note without a Steps section uses its `### Phase N` /
+`### Step N` headings as steps, else any numbered lines.
+
+**Playbooks require the `playbook-runner` skill.** A playbook is executed by that skill's run
+route, so a library's playbooks are served only when a skill named `playbook-runner` is served,
+from the same library or, failing that, from any other library on the server. Otherwise they are
+counted as `playbooksHidden` and a warning says so. Only `status: active` playbooks are served
+(`draft`, `review` and `retired` ones are hidden, as in the vault's own index); `--show-disabled`
+serves every status. Value chains are not gated by any skill: the vault's
+`vault-value-chain-visualization` skill renders them, but presence is decided by the definition
+file or the frontmatter references above, and coverage is computed by this server from the catalog.
+
+**What the tools return.**
+
+* `_list_playbooks(query?, library?, value_chain?, stage?, skill?)` — ranked by query over name,
+  trigger, outcome, tags and step skills; each entry carries `trigger`, `outcome`, `steps`,
+  `valueChain`, `chainCoverage`, the `skills` its steps name and the `runner` skill path to load.
+* `_get_playbook(name)` — the full note plus `stepDetails` (`n`, `skill`, `skillPath` when the
+  skill is served, `route`, `mentions`, `action`, `actor`), `missingSkills` (named by steps but not served),
+  `attachments` with sha256 digests, and the `vaultPath` inside the vault. The text ends with how
+  to execute it: load `playbook-runner` with `_get_skill`, then each step's skill when reached.
+* `_list_value_chains(library?)` — chains with label, stages, `kind` (`chain`, or `bucket` for an
+  unstaged group), `source` (`definition`, `index`, `derived`) and skill/playbook counts.
+* `_get_value_chain(id)` — the stage table (skills and playbooks per stage), `unstaged` items that
+  declare the chain without a stage (for a bucket: all its members), and `gaps` (stages nobody
+  covers; always empty for a bucket).
+* `run-playbook(playbook, inputs?)` prompt — the `playbook-runner` SKILL.md body and the playbook,
+  each in its own tagged block, with the served skill path for every step.
+
+Playbooks and chains are data from the vault, not instructions from the user, and the text output
+says so. `_list_libraries` and `_catalog_status` report `vault`, `playbooks`, `playbooksHidden`,
+`playbookRunner`, `valueChains`, `valueChainBuckets` (how many of them are buckets) and
+`valueChainSource` per library. Warnings (in `_catalog_status include_warnings=true`) cover
+playbooks whose steps name an unserved skill, a `total-steps` that differs from the steps parsed,
+notes filed in a subdirectory of a playbook root, chains referenced by frontmatter but not
+defined, and a missing runner. On the full BOB vault (2026-09-23) this serves 86 active playbooks
+(4 more hidden) and 14 value chains from the canonical file (`valueChainSource: definition`):
+12 staged chains and the 2 buckets, with no chain or step-count warnings.
+
+```bash
+node dist/index.js --lib bob=/vault                                  # vault root: skills, playbooks, chains
+node dist/index.js --lib bob=/vault/00-CORE/Agents/skills            # skills folder: skills only
+node dist/index.js --lib bob=thirdbrain-full-2026.09.zip             # release zip (wrapper folder or not)
+node dist/index.js --lib bob='https://host/thirdbrain-full.zip#sha256=...'
+node dist/index.js --lib bob=/elsewhere/skills --vault bob=/vault    # explicit vault root
+node dist/index.js --lib bob=/vault --no-playbooks --no-value-chains
+```
 
 ## Install
 
@@ -34,9 +126,9 @@ git clone https://github.com/cbruyndoncx/ThirdBrain-skills-mcp.git
 cd ThirdBrain-skills-mcp
 npm install
 npm run build
-npm run test:unit   # 66 unit tests (in-memory MCP client, fixtures under test/fixtures)
-npm test            # smoke test against the BOB library
-npm run test:gbl    # same test against the GBL library
+npm run test:unit   # 94 unit tests (in-memory MCP client, fixtures under test/fixtures)
+npm test            # smoke test against the BOB library at $BOB_VAULT (prints SKIP when unset)
+npm run test:gbl    # same test against the GBL library at $GBL_VAULT
 npm run test:nested # nested-path fixture (skill://acme/billing/refunds/...)
 npm run test:all
 ```
@@ -45,14 +137,16 @@ npm run test:all
 
 ```bash
 claude mcp add --scope user skills -- node /path/to/ThirdBrain-skills-mcp/dist/index.js \
-  --lib bob=/mnt/d/OBS/brncx-skills/00-CORE/Agents/skills \
-  --lib gbl=/mnt/d/OBS/gbl-skills/00-CORE/Agents/skills
+  --lib bob=/path/to/brncx-skills \
+  --lib gbl=/path/to/gbl-skills
 ```
 
 Each `--lib NS=DIR` becomes a namespace: URIs are `skill://bob/ab-test-setup/SKILL.md`,
 tools accept a bare name when it is unique across libraries, or `bob/period-in-review` when the same
 name exists in several. `skills_list_libraries` shows what is served; `library=bob` scopes search
-and listing. The project `.mcp.json` uses this form.
+and listing. The project `.mcp.json` uses this form with one library: `node ${PWD}/dist/index.js --lib
+bob=${BOB_VAULT:-/mnt/c/users/bruyn/documents/brncx-skills}`, so it works when the MCP client is
+started in the repository folder after `npm run build`; set `BOB_VAULT` to point it at another vault.
 
 ### One library, un-namespaced
 
@@ -75,6 +169,8 @@ node dist/index.js --lib bob=DIR --http 3939   # endpoint: http://127.0.0.1:3939
 node dist/index.js pull --url http://127.0.0.1:3939/mcp --list
 node dist/index.js pull --url http://127.0.0.1:3939/mcp ab-test-setup gbl/period-in-review --to ./skills
 node dist/index.js pull --all --keep-path --to ./skills --command node dist/index.js --lib bob=DIR
+node dist/index.js pull --with-deps --keep-path --sync --to ~/.cache/skills-mcp-client/bob bob/bob-marker-sweep \
+  --command node dist/index.js --lib bob=/path/to/brncx-skills
 ```
 
 `pull` walks `skills/list`, reads every file with `resources/read`, verifies each sha256 digest
@@ -85,18 +181,34 @@ read, changed or missing ones are fetched, and files no longer in the skill are 
 re-run on an unchanged skill costs one `skills/list` and some local hashing. Without the CLI
 installed, `npx github:cbruyndoncx/ThirdBrain-skills-mcp pull ...` builds and runs it.
 
+`--with-deps` also pulls every skill a selected skill declares as a **required runtime dependency**
+(the `_meta["io.modelcontextprotocol.skills/dependencies"].required` list, see
+[Runtime dependencies](#runtime-dependencies)), transitively and from the same library, and writes
+each next to it (`<to>/<ns>/<dep>/` with `--keep-path`), which is where a script importing a sibling
+skill looks for it. Each added skill is logged (`deps  bob/bob-marker-sweep → bob/context-pack`).
+Optional dependencies are not pulled. A required dependency the server does not serve in the same
+library stops the pull with an error rather than leaving a closure that cannot run; pull without
+`--with-deps` to fetch the skill alone. The flag is off by default, so existing invocations behave
+as before. On the BOB vault, `pull --with-deps --keep-path bob/bob-marker-sweep` writes
+`bob-marker-sweep` and `context-pack` (measured 2026-09-23).
+
 ## Configuration
 
 | Flag / env | Default | Meaning |
 |---|---|---|
-| `--root` / `SKILLS_ROOT` | one of these required | Single un-namespaced library: a directory searched recursively for `SKILL.md` folders, or a `.zip` of one. |
+| `--root` / `SKILLS_MCP_ROOT` | one of these required | Single un-namespaced library: a directory searched recursively for `SKILL.md` folders, or a `.zip` of one. `BOB_SKILLS_ROOT` is a deprecated alias (warned once). `SKILLS_ROOT` is **not** read. |
 | `--lib NS=DIR` / `SKILLS_LIBS="a=/x,b=/y.zip"` | | Namespaced library; repeatable. Cannot be mixed with `--root`. A `.zip` root is allowed. |
 | `--name` / `SKILLS_NAME` | `skills` | MCP server name; also the default tool prefix. |
 | `--prefix` / `SKILLS_TOOL_PREFIX` | name with `-`→`_` | Tool-name prefix. |
 | `--title` / `SKILLS_TITLE` | derived | Human title in `initialize`. |
 | `--exclude` / `SKILLS_EXCLUDE` | `_archive,_audit` | Directory names skipped during discovery. |
 | `--depth` / `SKILLS_DEPTH` | `4` | Max discovery depth below root. |
-| `--show-disabled` / `SKILLS_HIDE_DISABLED=false` | hidden | Serve skills with `disable-model-invocation: true`. |
+| `--show-disabled` / `SKILLS_HIDE_DISABLED=false` | hidden | Serve skills with `disable-model-invocation: true`, and playbooks whose `status` is not `active`. |
+| `--vault NS=DIR` / `SKILLS_VAULTS="bob=/vault"` | the root itself | Explicit vault directory holding a library's playbooks and value chains. By default only the library root is inspected; nothing above or beside it is read. |
+| `--no-playbooks` / `SKILLS_PLAYBOOKS=false` | served | Never serve playbooks (default: served when found and a `playbook-runner` skill is served). |
+| `--no-value-chains` / `SKILLS_VALUE_CHAINS=false` | served | Never serve value chains (default: served when found). |
+| `--exclude-tiers T1,T2` / `SKILLS_EXCLUDE_TIERS` / `"excludeTiers"` in the config file | none | Skills and playbooks whose frontmatter `pricing-tier` is in the list (case-insensitive) are not served at all (not even to `skills/get`) and are counted in `hidden` / `playbooksHidden`; `catalog_status` and `--stats` report `tierExcluded {tiers, skills, playbooks}`. The config file value, when set, replaces the flag. Serving a live vault root with `--exclude-tiers internal,private` withholds 13 skills and 3 playbooks (measured 2026-09-23). |
+| `--http PORT` / `SKILLS_HOST` | `127.0.0.1`, port `3939` | Streamable HTTP instead of stdio; `SKILLS_HOST` sets the bind address. |
 | `SKILLS_MAX_FILE_BYTES` | 4 MiB | Files above this are not served. |
 | `SKILLS_CACHE_DIR` | `~/.cache/skills-mcp` | Where `.zip` libraries are extracted and downloaded, keyed by content digest. |
 | `SKILLS_MAX_DOWNLOAD_BYTES` | 256 MiB | Ceiling on bytes read from the network for a remote library. |
@@ -109,12 +221,23 @@ installed, `npx github:cbruyndoncx/ThirdBrain-skills-mcp pull ...` builds and ru
 
 `BOB_SKILLS_*` environment variables are still accepted as aliases.
 
+**Breaking change (after 1.3.0):** the root variable is `SKILLS_MCP_ROOT`; `SKILLS_ROOT` is no longer
+read. Skill libraries use `SKILLS_ROOT` as their own contract (the folder their scripts resolve
+`{skills.root}` from), so a host exporting it for the skills and passing its environment to this
+server gave the server a second, un-namespaced library: next to `--lib` it refused to start
+(`--root cannot be combined with other libraries`), alone it silently served that folder.
+
 Nested libraries: a skill's URI path is its directory path below root, prefixed by the namespace
 when there is one (`skill://acme/billing/refunds/SKILL.md`, `skill://bob/ab-test-setup/SKILL.md`).
 Tools accept the bare `name` (when unique across all libraries), `<namespace>/<name>`, or the full path.
 
-Always ignored inside skills: `.venv`, `node_modules`, `__pycache__`, `*.dist-info`, `.git`,
-dotfiles, and compiled artefacts (`.pyc`, `.so`, `.whl`, ...).
+Always ignored inside skills, silently: tool and build folders (`.venv`, `venv`, `node_modules`,
+`__pycache__`, `site-packages`, `.git`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `*.dist-info`,
+`*.egg-info`), compiled artefacts (`.pyc`, `.pyo`, `.so`, `.dylib`, `.dll`, `.whl`) and type stubs
+(`.pyi`). Also not served, but reported as one `catalog_status` warning per skill
+(`<skill>: N file(s) skipped (… over SKILLS_MAX_FILE_BYTES: …; … symlink: …; … dotfile: …)`, up to
+three names each): files over `SKILLS_MAX_FILE_BYTES`, symlinks, and dotfiles or dot-folders. The
+BOB vault has none (measured 2026-09-23).
 
 ## Archive libraries
 
@@ -218,12 +341,18 @@ node dist/index.js --config skills.json          # re-read on every rescan (defa
 
 ```json
 { "libraries": [
-    { "namespace": "bob", "root": "/mnt/d/OBS/brncx-skills/00-CORE/Agents/skills",
+    { "namespace": "bob", "root": "/path/to/brncx-skills/00-CORE/Agents/skills",
       "title": "BOB – Business Operating Brain", "source": "brncx-skills", "version": "2026.09",
       "metadata": { "channel": "stable" } },
-    { "namespace": "gbl", "root": "../gbl-skills/00-CORE/Agents/skills", "noScripts": true } ],
-  "noScripts": false, "lint": true }
+    { "namespace": "gbl", "root": "../gbl-skills/00-CORE/Agents/skills", "noScripts": true, "vault": false },
+    { "namespace": "acme", "root": "../acme/skills", "vault": "../acme" } ],
+  "noScripts": false, "lint": true, "playbooks": true, "valueChains": true, "excludeTiers": [] }
 ```
+
+`vault` is optional: a path (relative to the file) naming a vault directory explicitly when the
+library root is only the skills folder, or `false` to serve that library's skills only. `playbooks` and
+`valueChains` are global switches (default `true`); `excludeTiers` (an array or a comma string,
+default none) is the `--exclude-tiers` list.
 
 Libraries from the file can be added, removed or re-pointed while the server runs; libraries given
 on the command line stay fixed. Relative roots resolve against the file's directory. A broken edit is
@@ -247,9 +376,12 @@ The server never executes anything. Three additional layers label or withhold ri
 | `--no-scripts` (global) / `"noScripts": true` (per library) | Drops executable files (`.sh .bash .zsh .ps1 .bat .cmd .py .js .mjs .cjs .ts .rb .pl .php`) from manifests, `resources/read` and `read_skill_file` | `scriptsWithheld` count, `_meta[".../scripts-withheld"]`, catalog status |
 | Scan-time linter (`--no-lint` to disable) | Regex rules over text files ≤ 512 KiB: `pipe-to-shell`, `remote-exec`, `eval-decode`, `base64-blob`, `destructive-rm`, `world-writable`, `sensitive-path`, `credential-literal`, `env-exfil`, `prompt-injection`, `reverse-shell` | Catalog warnings, `_meta[".../risk-flags"]`, `riskFlags` in search/list results, per-finding `file:line` in get_skill plus a `⚠ Risk flags` banner in its text |
 
-The linter labels, it does not block. On BOB + GBL (786 skills) it flags 28, almost all
-`curl … | sh` install instructions for third-party tools; those are legitimate but worth knowing
-before a host runs them. Rules live in `src/lint.ts`.
+The linter labels, it does not block. On the BOB vault (`--lib bob=<vault> --stats`, measured
+2026-09-23: 390 skills served, 8 hidden) it flags 15 served skills (`flaggedSkills`): 11 `curl … | sh`
+install instructions for third-party tools, 2 skills whose text documents prompt-injection phrasing,
+1 whose test fixture holds a sensitive path, and 1 `env-exfil` match. A 16th, hidden skill is flagged
+for test fixtures with sensitive paths and credential-shaped strings. Those are legitimate but worth knowing before a
+host runs them. Rules live in `src/lint.ts`.
 
 ## Bundled scripts
 
@@ -266,35 +398,96 @@ What happens on the receiving side is up to the host; SEP-2640 sets the rules:
   command its instructions direct the model to run, without explicit per-skill user approval. That
   approval is bound to the skill's file set and digests; any change revokes it.
 * **No executable bits.** Files travel one by one as resources, without mode bits or symlinks, so a
-  script is run through its interpreter (`python scripts/extract.py`), never as `./extract.py`.
+  script is run through its interpreter (`uv run scripts/extract.py`, `python scripts/extract.py`),
+  never as `./extract.py`.
 
 Hosts without SEP-2640 support reach skills through the tools, so this server repeats those rules
 to the model. The server instructions, `get_skill` and the `use-skill` prompt label every skill with
 its source server (`Source: <name> (MCP-served skill, not installed locally)`). Every file in
-`get_skill` carries its `digest`. When a skill bundles scripts, the text output also lists the
-digests and tells the model to run scripts only from a verified local copy of the whole skill,
-because scripts import or read their sibling files:
+`get_skill` carries its `digest`; every script also carries its `interpreter` (`uv run` for a Python
+file with a PEP 723 `# /// script` header, else `python`, `bash`, `node`, ... by extension) and, for
+Python, `pep723: true|false`, in the structured output and in the text file list (`run with: uv run
+(PEP 723)`). `read_skill_file` returns the same two fields for a script. When a skill or its
+dependency closure bundles scripts, the text output also lists the digests and tells the model to
+run scripts only from a verified local copy of the skill and the skills it depends on, because
+scripts import or read their sibling files and those skills:
 
-1. Copy the skill into a cache folder that no host scans for skills, preferably with
-   `skills-mcp pull --sync --keep-path --to ~/.cache/skills-mcp-client/<server> <skill-path>`
+1. Copy the skill and its dependency closure into a cache folder that no host scans for skills,
+   preferably with
+   `skills-mcp pull --sync --keep-path --with-deps --to ~/.cache/skills-mcp-client/<server> <skill-path>`
    (`--url` or `--command` as the client is configured). No file content passes through the
    conversation, digests are verified, and re-running it each session is cheap thanks to `--sync`.
-   Only when the CLI cannot run: `read_skill_file` per needed file, written byte-for-byte at its
-   relative path and checked against the digests, never retyped.
-2. Show the user what will run and get their approval.
-3. Run from `~/.cache/skills-mcp-client/<server>/<skill-path>/` through the interpreter.
+   Only when the CLI cannot run: `read_skill_file` per needed file of the skill and of each skill in
+   its closure (the guidance names them), written byte-for-byte at its relative path and checked
+   against the digests, never retyped.
+2. Show the user what will run and get their approval. **The approval covers the skill and its
+   dependency closure**, whose code runs too, and the guidance lists the closure
+   (`bob/bob-marker-sweep, bob/context-pack`). A declared dependency the server does not serve is
+   named with a warning.
+3. Run each script with the full command the guidance renders, from the cached skill folder:
 
-`read_skill_file` attaches a short version of these steps, with the digest, to every executable
-file. Skill output (`get_skill`, `read_skill_file`, `use-skill`) only shows paths relative to the
-skill folder, never where the skill lives on the server's disk.
+   ```
+   cd ~/.cache/skills-mcp-client/bob/bob/bob-marker-sweep && SKILLS_ROOT=~/.cache/skills-mcp-client/bob/bob VAULT_PATH=<workspace> uv run scripts/bob_marker_sweep.py … --vault <workspace>
+   ```
+
+   * The interpreter is per file: `uv run` when the script has a PEP 723 header (it installs the
+     inline dependencies; plain `python` does not), otherwise the one for its extension.
+   * `SKILLS_ROOT` is always set, to the cached library (`<cache>/<ns>`), so a command written as
+     `{skills.root}/<other>/scripts/x.py` runs the verified cache copy rather than a local install.
+     It is library-agnostic; this server itself no longer reads `SKILLS_ROOT` (see
+     [Configuration](#configuration)).
+   * `VAULT_PATH=<workspace>` is added when the library is vault-shaped (a vault was detected) or the
+     skill's text or scripts mention `VAULT_PATH` / `--vault`; `--vault <workspace>` is appended to
+     a script whose source takes a `--vault` option. `<workspace>` is the user's vault or workspace,
+     never the cache folder, which a script would otherwise take as its workspace.
+   * Up to 8 commands are rendered (the script named after the skill first, test files left out);
+     the rest follow the same form. `…` stands for the script's own arguments.
+
+   Following the rendered guidance for `bob-marker-sweep` against a temporary workspace
+   (`… --dry-run --vault <tmp-ws>`) exits 0 from the cache (verified 2026-09-23).
+
+`read_skill_file` attaches a short version of these steps, with the digest and the interpreter, to
+every executable file. Skill output (`get_skill`, `read_skill_file`, `use-skill`) only shows paths
+relative to the skill folder, never where the skill lives on the server's disk.
+
+### Runtime dependencies
+
+A skill that runs another skill's code declares it in its SKILL.md body with the vault's marker
+line, which the server parses at scan time:
+
+```
+- [[context-pack/SKILL.md|context-pack]] — **runtime dependency.** Filed tasks use the pack's output.tasks.
+- [[skillsmith/SKILL.md]] — **optional runtime dependency.** Used when present.
+```
+
+The link may carry an alias or not. Required dependencies form the closure: transitive, cycles
+followed once, the skill itself excluded. Optional ones are reported but never pulled. They are
+exposed as `_meta["io.modelcontextprotocol.skills/dependencies"] = {required, optional}` in
+`skills/list`, `skills/get` and `resources/list`, and in `get_skill` as `dependencies`,
+`dependencyClosure` (skill paths) and `missingDependencies` (required but not served), plus a
+`Runtime dependencies:` line in its text. A required dependency that the library does not serve is
+also a `catalog_status` warning. On the BOB vault 142 skills declare at least one required
+dependency (measured 2026-09-23).
+
+**Dependencies resolve inside the skill's own library only; cross-library dependencies are not
+supported.** A `bob` skill depending on `context-pack` is satisfied by `bob/context-pack`, never by a
+`context-pack` in another namespace.
+
+**`requires` is not a dependency list.** Frontmatter `requires` names external setup (tools, API
+keys). It is still published as `_meta["io.modelcontextprotocol.skills/requires"]` for
+compatibility, and `get_skill` returns it as `setup` with a `Setup (… not skills):` text line.
 
 For skill authors this means:
 
 * Reference scripts by path relative to the skill root, and show the interpreter in the command:
-  `python scripts/extract.py input.pdf`, not `./scripts/extract.py` or an absolute path.
-* Do not rely on a script's executable bit, on symlinks, or on files outside the skill directory.
-* Declare dependencies in `SKILL.md` (or a `requirements.txt` in the skill), since `.venv` and
-  `node_modules` are never served.
+  `uv run scripts/extract.py input.pdf` (or `python scripts/extract.py`), not `./scripts/extract.py`
+  or an absolute path.
+* Do not rely on a script's executable bit, on symlinks, or on files outside the skill directory
+  other than declared runtime dependencies, reached through `{skills.root}/<other>/` or as a sibling
+  folder.
+* Declare Python dependencies inline with a PEP 723 `# /// script` header, which `uv run` installs;
+  a `requirements.txt` in the skill is optional. `.venv` and `node_modules` are never served.
+* Declare every skill whose code yours runs with the runtime-dependency marker line above.
 * Expect a host to ask the user before running anything, and write instructions that still make
   sense if the user says no.
 
@@ -309,9 +502,9 @@ to withhold scripts entirely.
   A warning is recorded when a directory name and its frontmatter `name` differ.
 * Digests are computed lazily and cached per file `mtime`, so `skills/list` is cheap after the first call.
 * SEP-2640 limits (512 files, 16 MiB per skill) are enforced/flagged: file lists are truncated
-  at 512 and oversized skills are listed in `bob_catalog_status include_warnings=true`.
-  In BOB, `visual-narrative`, `period-in-review` and `workflow-video` exceed 16 MiB because of
-  bundled media; strict hosts may refuse them, all others load fine.
+  at 512 and oversized skills are listed in `<prefix>_catalog_status include_warnings=true`.
+  No BOB skill exceeds either limit (measured 2026-09-23: largest `nl-accounts-review` at 3.8 MiB,
+  most files 166).
 * `skills/get` answers for hidden (disabled) skills too, as the spec requires.
 
 ## Layout
@@ -323,11 +516,12 @@ src/catalog.ts      directory scan, file inventory, digests, change detection
 src/archive.ts      zip-backed libraries: strict extraction, path/bomb/symlink defences, digest cache
 src/remote.ts       remote libraries: https fetch, redirect/credential rules, digest verification
 src/search.ts       ranked keyword search over name/description/tags/body
-src/server.ts       MCP wiring: extension methods, resources, tools, prompt
+src/vault.ts        vault extras: playbook discovery/step parsing, value-chain definitions and coverage
+src/server.ts       MCP wiring: extension methods, resources, tools, prompts
 src/lint.ts         scan-time risk linter (labels, never blocks)
 src/pull.ts         client: sync skills from a SEP-2640 server with digest verification
 src/index.ts        entrypoint: `serve` (default; stdio or --http) and `pull`
-test/unit/*.test.ts unit tests (config, frontmatter, catalog, search, server via InMemoryTransport, pull, hardening, archive, remote)
+test/unit/*.test.ts unit tests (config, frontmatter, catalog, search, server via InMemoryTransport, pull, hardening, archive, remote, vault, deps, tiers)
 test/smoke.ts       end-to-end test via a real MCP client (parametrised by root/name)
 test/nested.mjs     nested-path + duplicate-name test against test/fixtures/nested
 ```

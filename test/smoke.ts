@@ -2,10 +2,21 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { z } from "zod";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 
 // Usage: tsx test/smoke.ts [ROOT] [NAME] [SEARCH_QUERY] [EXPECTED_TOP_HIT] [SKILL_WITH_FILES] [FILE_IN_THAT_SKILL]
-const [ROOT = "/mnt/d/OBS/brncx-skills/00-CORE/Agents/skills", NAME = "bob", QUERY = "A/B test sample size", TOP = "ab-test-setup",
+// ROOT omitted, "" or "-": <vault>/00-CORE/Agents/skills, where <vault> is $GBL_VAULT when NAME is
+// "gbl" and $BOB_VAULT otherwise. When that variable is unset or the folder is missing, the smoke
+// test prints SKIP and exits 0 (it needs a real skills library; the unit tests use fixtures).
+const [ROOT_ARG = "", NAME = "bob", QUERY = "A/B test sample size", TOP = "ab-test-setup",
   SKILL = "browser-use-cli", FILE = "references/troubleshooting.md"] = process.argv.slice(2);
+const VAULT_ENV = NAME === "gbl" ? "GBL_VAULT" : "BOB_VAULT";
+const ROOT = ROOT_ARG && ROOT_ARG !== "-" ? ROOT_ARG : process.env[VAULT_ENV] ? path.join(process.env[VAULT_ENV]!, "00-CORE", "Agents", "skills") : "";
+if (!ROOT || !fs.existsSync(ROOT)) {
+  console.log(`SKIP: ${ROOT ? `${ROOT} not found` : `no ROOT argument and $${VAULT_ENV} is not set`}`);
+  process.exit(0);
+}
 const P = NAME.replace(/-/g, "_");
 const tool = (n: string) => `${P}_${n}`;
 
@@ -80,7 +91,7 @@ assert.equal((libs.structuredContent as any).libraries.length, 1);
 console.log("✓ list_libraries");
 
 const p = await client.getPrompt({ name: "use-skill", arguments: { skill: TOP, task: "demo task" } });
-assert.ok((p.messages[0].content as any).text.includes(`<skill name="${TOP}">`));
+assert.ok((p.messages[0].content as any).text.includes(`<skill name="${TOP}" source="${NAME}">`));
 console.log("✓ prompt use-skill");
 
 const st = await client.callTool({ name: tool("catalog_status"), arguments: { include_warnings: true } });

@@ -8,6 +8,10 @@ import { splitFrontmatter, coerceString, coerceList } from "./frontmatter.js";
 import { lintFiles, SCRIPT_EXTENSIONS, type LintFinding } from "./lint.js";
 import { extractLibrary, pruneCache, isArchivePath } from "./archive.js";
 import { fetchArchive, pruneDownloads, redact } from "./remote.js";
+import {
+  detectLayout, findPlaybookRoots, findChainFiles, scanPlaybooks, loadChainDefinitions, buildValueChains, digestOf, PLAYBOOK_RUNNER, PLAYBOOK_DIR, PRIVATE_PLAYBOOK_DIRS,
+  type Playbook, type PlaybookAttachment, type ValueChain,
+} from "./vault.js";
 
 export interface SkillFile {
   /** Path relative to the skill directory, always with forward slashes. */
@@ -18,6 +22,77 @@ export interface SkillFile {
   mimeType: string;
   /** Lazily computed sha256:<hex>. */
   digest?: string;
+  /** Lazily read for script files: how to run it (see Catalog.scriptInfo). */
+  script?: ScriptInfo;
+}
+
+/** What a host needs to know to run a bundled script from a cached copy. */
+export interface ScriptInfo {
+  /** Python file with a PEP 723 `# /// script` header: run with `uv run`, which installs its inline dependencies. */
+  pep723: boolean;
+  /** The script's source mentions a `--vault` option, so it is handed the user's workspace explicitly. */
+  vaultFlag: boolean;
+  /** The script's source mentions `VAULT_PATH`. */
+  vaultEnv: boolean;
+}
+
+/** Runtime dependencies declared in SKILL.md with the vault's marker line. */
+export interface SkillDependencies {
+  /** Skill names whose code this skill runs; pulled with it by `pull --with-deps`. */
+  required: string[];
+  /** Skill names used when present; reported, never pulled. */
+  optional: string[];
+}
+
+/**
+ * The marker line a SKILL.md uses to declare another skill it runs code from:
+ * `[[context-pack/SKILL.md|context-pack]] — **runtime dependency.**` (required) or
+ * `— **optional runtime dependency.**`. The link may carry an alias or not.
+ */
+const DEPENDENCY_MARKER = /\[\[([a-z0-9-]+)\/SKILL\.md(?:\|[^\]]*)?\]\]\s*—\s*\*\*(optional )?runtime dependency\.\*\*/g;
+
+/** Parse the runtime-dependency markers of a SKILL.md body. A name marked both ways counts as required; a self-reference is ignored. */
+export function parseDependencies(body: string, self?: string): SkillDependencies {
+  const required = new Set<string>(), optional = new Set<string>();
+  for (const m of body.matchAll(DEPENDENCY_MARKER)) {
+    if (m[1] === self) continue;
+    (m[2] ? optional : required).add(m[1]);
+  }
+  for (const r of required) optional.delete(r);
+  return { required: [...required], optional: [...optional] };
+}
+
+/** Files inside a skill that are not served, by reason; reported as one catalog warning per skill. */
+interface Skips { oversize: string[]; symlink: string[]; dotfile: string[] }
+const newSkips = (): Skips => ({ oversize: [], symlink: [], dotfile: [] });
+
+/** `bob/x: 3 file(s) skipped (1 over SKILLS_MAX_FILE_BYTES: big.bin; 2 dotfile: .env, cfg/.x)`, or null when nothing was skipped. */
+export function skipWarning(skillPath: string, sk: Skips): string | null {
+  const parts: string[] = [];
+  const list = (xs: string[]) => xs.slice(0, 3).join(", ") + (xs.length > 3 ? `, +${xs.length - 3} more` : "");
+  if (sk.oversize.length) parts.push(`${sk.oversize.length} over SKILLS_MAX_FILE_BYTES: ${list(sk.oversize)}`);
+  if (sk.symlink.length) parts.push(`${sk.symlink.length} symlink: ${list(sk.symlink)}`);
+  if (sk.dotfile.length) parts.push(`${sk.dotfile.length} dotfile: ${list(sk.dotfile)}`);
+  const n = sk.oversize.length + sk.symlink.length + sk.dotfile.length;
+  return n ? `${skillPath}: ${n} file(s) skipped (${parts.join("; ")})` : null;
+}
+
+/** Interpreter a host should put in front of a bundled script, by extension (PEP 723 Python → uv run). */
+export function interpreterFor(rel: string, info?: Pick<ScriptInfo, "pep723">): string {
+  const ext = path.extname(rel).toLowerCase();
+  switch (ext) {
+    case ".py": return info?.pep723 ? "uv run" : "python";
+    case ".sh": case ".bash": return "bash";
+    case ".zsh": return "zsh";
+    case ".js": case ".mjs": case ".cjs": return "node";
+    case ".ts": return "npx tsx";
+    case ".ps1": case ".psm1": return "pwsh -File";
+    case ".bat": case ".cmd": return "cmd /c";
+    case ".rb": return "ruby";
+    case ".pl": return "perl";
+    case ".php": return "php";
+    default: return "";
+  }
 }
 
 export interface Skill {
@@ -32,7 +107,10 @@ export interface Skill {
   version: string;
   tags: string[];
   valueChains: string[];
+  /** Frontmatter `requires`: external setup (tools, keys), not other skills. */
   requires: string[];
+  /** Other skills this one runs code from, from the SKILL.md marker lines. */
+  dependencies: SkillDependencies;
   disabled: boolean;      // disable-model-invocation: true
   userInvocable: boolean;
   frontmatter: Record<string, unknown>;
@@ -58,6 +136,19 @@ export interface LibraryStats {
   skills: number;
   hidden: number;
   noScripts: boolean;
+  /** True when a vault root was found (or configured) for this library. */
+  vault: boolean;
+  /** Playbooks served (status active, or all with --show-disabled). */
+  playbooks: number;
+  /** Playbooks found but not served: non-active status, or no playbook-runner skill available. */
+  playbooksHidden: number;
+  /** Skill path of the playbook-runner skill that executes this library's playbooks, when served. */
+  playbookRunner?: string;
+  valueChains: number;
+  /** Where the chain definitions come from; absent when no value chains are served. */
+  valueChainSource?: "definition" | "index" | "derived";
+  /** How many of `valueChains` are unstaged buckets (e.g. infrastructure, operating-controls); absent when none. */
+  valueChainBuckets?: number;
 }
 
 /** The client-facing view of a library: everything in LibraryStats except where it lives. */
@@ -73,10 +164,14 @@ export interface CatalogStats {
   scriptsWithheld: number;
   /** Skills not served because they bundle an archive file. */
   archiveSkillsRejected: number;
+  /** Skills and playbooks not served because their pricing-tier is in --exclude-tiers (also counted in hidden / playbooksHidden). Present only when tiers are excluded. */
+  tierExcluded?: { tiers: string[]; skills: number; playbooks: number };
   skills: number;
   hidden: number;
   files: number;
   bytes: number;
+  playbooks: number;
+  valueChains: number;
   categories: Record<string, number>;
   warnings: string[];
   scannedAt: string;
@@ -114,6 +209,12 @@ export function isTextMime(m: string): boolean {
 export class Catalog {
   private skills = new Map<string, Skill>();
   private hidden = new Map<string, Skill>();
+  /** Served playbooks keyed by playbookPath (`<ns>/<stem>`). */
+  private playbooks = new Map<string, Playbook>();
+  /** Value chains keyed by `<ns>/<id>`. */
+  private chains = new Map<string, ValueChain>();
+  /** Per library: the playbook-runner skill path that executes its playbooks. */
+  private runners = new Map<string, string>();
   private stats!: CatalogStats;
   private scanning: Promise<void> | null = null;
   private listeners = new Set<() => void>();
@@ -122,6 +223,14 @@ export class Catalog {
   /** Remote libraries, memoised by URL. A pinned release URL is fetched once per process. */
   private remoteState = new Map<string, { dir: string; digest: string }>();
   private archiveRejected = 0;
+  /** Per scan: skills (by library) and playbooks withheld by --exclude-tiers. */
+  private tierHidden = { skills: new Map<string, number>(), playbooks: 0 };
+
+  /** True when a note's pricing-tier is excluded by configuration. */
+  private tierExcluded(fm: Record<string, unknown>): boolean {
+    if (!this.cfg.excludeTiers?.size) return false;
+    return coerceList(fm["pricing-tier"]).some((t) => this.cfg.excludeTiers.has(t.toLowerCase()));
+  }
 
   constructor(private cfg: Config) {}
 
@@ -130,11 +239,72 @@ export class Catalog {
     return () => this.listeners.delete(fn);
   }
 
-  getStats(): CatalogStats { return this.stats ?? { root: this.cfg.root, libraries: [], flaggedSkills: 0, scriptsWithheld: 0, archiveSkillsRejected: 0, skills: 0, hidden: 0, files: 0, bytes: 0, categories: {}, warnings: [], scannedAt: "", scanMs: 0 }; }
+  getStats(): CatalogStats { return this.stats ?? { root: this.cfg.root, libraries: [], flaggedSkills: 0, scriptsWithheld: 0, archiveSkillsRejected: 0, skills: 0, hidden: 0, files: 0, bytes: 0, playbooks: 0, valueChains: 0, categories: {}, warnings: [], scannedAt: "", scanMs: 0 }; }
   all(library?: string): Skill[] {
     const v = [...this.skills.values()].filter((s) => library === undefined || s.library === library);
     return v.sort((a, b) => a.skillPath.localeCompare(b.skillPath));
   }
+
+  // ---- playbooks and value chains (vault extras) ----
+  allPlaybooks(library?: string): Playbook[] {
+    return [...this.playbooks.values()].filter((p) => library === undefined || p.library === library).sort((a, b) => a.playbookPath.localeCompare(b.playbookPath));
+  }
+  /** Look up by playbook path, `<library>/<name>`, or bare name/title (case-insensitive) when unambiguous. */
+  getPlaybook(key: string): Playbook | undefined {
+    const k = key.trim();
+    const direct = this.playbooks.get(k);
+    if (direct) return direct;
+    const lower = k.toLowerCase();
+    const [maybeLib, ...rest] = k.split("/");
+    const inLib = rest.length ? rest.join("/").toLowerCase() : undefined;
+    let found: Playbook | undefined;
+    for (const p of this.playbooks.values()) {
+      const hit = inLib !== undefined
+        ? p.library === maybeLib && (p.name.toLowerCase() === inLib || p.title.toLowerCase() === inLib)
+        : p.name.toLowerCase() === lower || p.title.toLowerCase() === lower;
+      if (hit) { if (found && found !== p) return undefined; found = p; }
+    }
+    return found;
+  }
+  /** The playbook-runner skill path for a library's playbooks (same library first, else any library). */
+  playbookRunner(library: string): Skill | undefined {
+    const p = this.runners.get(library);
+    return p ? this.skills.get(p) : undefined;
+  }
+  allValueChains(library?: string): ValueChain[] {
+    return [...this.chains.values()].filter((c) => library === undefined || c.library === library);
+  }
+  getValueChain(id: string, library?: string): ValueChain | undefined {
+    const k = id.trim().toLowerCase();
+    if (library !== undefined) return this.chains.get(library ? `${library}/${k}` : k);
+    const direct = [...this.chains.values()].filter((c) => c.id === k);
+    if (direct.length === 1) return direct[0];
+    if (direct.length > 1) return undefined;
+    const [lib, ...rest] = k.split("/");
+    return rest.length ? this.chains.get(`${lib}/${rest.join("/")}`) : undefined;
+  }
+  /** Parse playbook://<playbookPath>[/<attachment>]. */
+  resolvePlaybookUri(uri: string): { playbook: Playbook; attachment?: PlaybookAttachment; rel: string } | null {
+    if (!uri.startsWith("playbook://")) return null;
+    const segs = uri.slice("playbook://".length).split("/").filter(Boolean).map((p) => decodeURIComponent(p));
+    if (segs.some((p) => p === "..")) return null;
+    for (let n = segs.length; n >= 1; n--) {
+      const pb = this.playbooks.get(segs.slice(0, n).join("/"));
+      if (!pb) continue;
+      const rel = segs.slice(n).join("/");
+      return { playbook: pb, attachment: rel ? pb.attachments.find((a) => a.rel === rel) : undefined, rel };
+    }
+    return null;
+  }
+  /** Parse value-chain://[<library>/]<id>. */
+  resolveValueChainUri(uri: string): ValueChain | null {
+    if (!uri.startsWith("value-chain://")) return null;
+    const segs = uri.slice("value-chain://".length).split("/").filter(Boolean).map((p) => decodeURIComponent(p));
+    if (segs.length === 2) return this.chains.get(`${segs[0]}/${segs[1].toLowerCase()}`) ?? null;
+    if (segs.length === 1) return this.chains.get(segs[0].toLowerCase()) ?? null;
+    return null;
+  }
+  digestForPlaybook(f: { abs: string; digest?: string }): Promise<string> { return digestOf(f); }
   libraries(): Library[] { return this.cfg.libraries; }
   /** Look up by skill path, or by bare name when unambiguous. */
   get(key: string): Skill | undefined { return this.find(key, false); }
@@ -170,6 +340,48 @@ export class Catalog {
     return null;
   }
 
+  /**
+   * A skill's runtime-dependency closure inside its own library: every skill reached through
+   * required markers, transitively, in discovery order, without the skill itself. Cycles are
+   * followed once. Names that resolve to no skill in the library are returned as `missing`;
+   * dependencies on other libraries are not supported.
+   */
+  dependencyClosure(s: Skill): { skills: Skill[]; missing: string[] } {
+    const seen = new Set<string>([s.skillPath]);
+    const out: Skill[] = [], missing: string[] = [];
+    const queue = [...s.dependencies.required];
+    const from = new Map(queue.map((d) => [d, s]));
+    while (queue.length) {
+      const name = queue.shift()!;
+      const dep = this.inLibrary(from.get(name)!.library, name);
+      if (!dep) { if (!missing.includes(name)) missing.push(name); continue; }
+      if (seen.has(dep.skillPath)) continue;
+      seen.add(dep.skillPath);
+      out.push(dep);
+      for (const next of dep.dependencies.required) if (!from.has(next)) { from.set(next, dep); queue.push(next); }
+    }
+    return { skills: out, missing };
+  }
+
+  /** A served skill (hidden included) by frontmatter name inside one library. */
+  private inLibrary(library: string, name: string, maps: Map<string, Skill>[] = [this.skills, this.hidden]): Skill | undefined {
+    for (const m of maps) for (const s of m.values()) if (s.library === library && s.name === name) return s;
+    return undefined;
+  }
+
+  /** How to run a bundled script: PEP 723 header, whether it takes --vault / reads VAULT_PATH. Read once per file version. */
+  async scriptInfo(f: SkillFile): Promise<ScriptInfo> {
+    if (f.script) return f.script;
+    let text = "";
+    try { text = (await fs.readFile(f.abs, "utf8")).slice(0, 512 * 1024); } catch { /* unreadable: report defaults */ }
+    f.script = {
+      pep723: f.rel.toLowerCase().endsWith(".py") && /^# \/\/\/ script\s*$/m.test(text),
+      vaultFlag: /--vault\b/.test(text),
+      vaultEnv: /\bVAULT_PATH\b/.test(text),
+    };
+    return f.script;
+  }
+
   async digestFor(f: SkillFile): Promise<string> {
     if (f.digest) return f.digest;
     const buf = await fs.readFile(f.abs);
@@ -193,9 +405,11 @@ export class Catalog {
     const t0 = Date.now();
     const warnings: string[] = [];
     this.archiveRejected = 0;
+    this.tierHidden = { skills: new Map(), playbooks: 0 };
     const next = new Map<string, Skill>();
     const nextHidden = new Map<string, Skill>();
     const dirs: Discovered[] = [];
+    const layouts = new Map<string, import("./vault.js").VaultLayout>();
     for (const lib of this.cfg.libraries) {
       if (!lib.url) {
         try { await fs.access(lib.root); } catch (e) {
@@ -215,7 +429,9 @@ export class Catalog {
           continue;
         }
       }
-      await this.discover(lib, effectiveRoot, lib.namespace, 0, dirs);
+      const layout = await detectLayout(effectiveRoot, this.cfg.playbooks || this.cfg.valueChains ? lib.vault : false, this.cfg.excludeDirs, this.cfg.ignoreDirs);
+      layouts.set(lib.namespace, layout);
+      await this.discover(lib, layout.skillsRoot, lib.namespace, 0, dirs);
     }
     if (this.cfg.libraries.some((l) => l.archive)) {
       // Drop extractions and downloads that are no longer referenced or have been replaced.
@@ -238,6 +454,8 @@ export class Catalog {
         try {
           const s = await this.loadSkill(d, oldAll.get(d.skillPath), warnings);
           if (!s) continue;
+          // Excluded tiers are withheld entirely (not even skills/get answers), and counted as hidden.
+          if (this.tierExcluded(s.frontmatter)) { this.tierHidden.skills.set(s.library, (this.tierHidden.skills.get(s.library) ?? 0) + 1); continue; }
           if (next.has(s.skillPath) || nextHidden.has(s.skillPath)) { warnings.push(`${s.skillPath}: duplicate skill path`); continue; }
           (s.disabled && this.cfg.hideDisabled ? nextHidden : next).set(s.skillPath, s);
         } catch (e) {
@@ -246,18 +464,33 @@ export class Catalog {
       }
     };
     await Promise.all(Array.from({ length: CONC }, worker));
+    for (const s of [...next.values(), ...nextHidden.values()]) {
+      const missing = s.dependencies.required.filter((d) => !this.inLibrary(s.library, d, [next, nextHidden]));
+      if (missing.length) warnings.push(`${s.skillPath}: runtime dependenc${missing.length > 1 ? "ies" : "y"} ${missing.map((d) => `'${d}'`).join(", ")} not served in library '${s.library || "(root)"}'; pull --with-deps cannot complete its closure`);
+    }
 
-    const changed = this.diff(this.skills, next);
+    const vault = await this.scanVaults(layouts, next, warnings);
+    const changed = this.diff(this.skills, next) || this.diffVault(vault.playbooks, vault.chains);
     this.skills = next;
     this.hidden = nextHidden;
+    this.playbooks = vault.playbooks;
+    this.chains = vault.chains;
+    this.runners = vault.runners;
     const categories: Record<string, number> = {};
     let files = 0, bytes = 0;
     const perLib = new Map<string, LibraryStats>(this.cfg.libraries.map((l) => {
       const kind = l.url ? "url" : l.archive ? "archive" : "directory";
       const digest = l.url ? this.remoteState.get(l.url)?.digest : l.archive ? this.archiveState.get(l.root)?.digest : undefined;
-      const st: LibraryStats = { namespace: l.namespace, root: l.root, kind, skills: 0, hidden: 0, noScripts: !!(l.noScripts || this.cfg.noScripts) };
+      const v = vault.perLib.get(l.namespace);
+      const st: LibraryStats = {
+        namespace: l.namespace, root: l.root, kind, skills: 0, hidden: 0, noScripts: !!(l.noScripts || this.cfg.noScripts),
+        vault: !!v, playbooks: v?.playbooks ?? 0, playbooksHidden: v?.playbooksHidden ?? 0, valueChains: v?.valueChains ?? 0,
+      };
       if (digest) st.digest = digest;
       if (l.info) st.info = l.info;
+      if (v?.runner) st.playbookRunner = v.runner;
+      if (v?.chainSource) st.valueChainSource = v.chainSource;
+      if (v?.buckets) st.valueChainBuckets = v.buckets;
       return [l.namespace, st];
     }));
     let flaggedSkills = 0, scriptsWithheld = 0;
@@ -269,11 +502,99 @@ export class Catalog {
       scriptsWithheld += s.scriptsWithheld;
     }
     for (const s of nextHidden.values()) perLib.get(s.library)!.hidden++;
+    let tierSkills = 0;
+    for (const [ns, n] of this.tierHidden.skills) { perLib.get(ns)!.hidden += n; tierSkills += n; }
     this.stats = {
-      root: this.cfg.root, libraries: [...perLib.values()], flaggedSkills, scriptsWithheld, archiveSkillsRejected: this.archiveRejected, skills: next.size, hidden: nextHidden.size, files, bytes, categories, warnings,
+      root: this.cfg.root, libraries: [...perLib.values()], flaggedSkills, scriptsWithheld, archiveSkillsRejected: this.archiveRejected, skills: next.size, hidden: nextHidden.size + tierSkills, files, bytes,
+      ...(this.cfg.excludeTiers?.size ? { tierExcluded: { tiers: [...this.cfg.excludeTiers], skills: tierSkills, playbooks: this.tierHidden.playbooks } } : {}),
+      playbooks: vault.playbooks.size, valueChains: vault.chains.size, categories, warnings,
       scannedAt: new Date().toISOString(), scanMs: Date.now() - t0,
     };
     if (changed) for (const fn of this.listeners) fn();
+  }
+
+  private diffVault(playbooks: Map<string, Playbook>, chains: Map<string, ValueChain>): boolean {
+    if (playbooks.size !== this.playbooks.size || chains.size !== this.chains.size) return true;
+    for (const [k, v] of this.playbooks) {
+      const w = playbooks.get(k);
+      if (!w || w.mtimeMs !== v.mtimeMs || w.size !== v.size || w.attachments.length !== v.attachments.length) return true;
+    }
+    for (const [k, v] of this.chains) {
+      const w = chains.get(k);
+      if (!w || w.skillCount !== v.skillCount || w.playbookCount !== v.playbookCount || w.stages.join() !== v.stages.join()) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Playbooks and value chains for every library that sits in a vault. Playbooks are served only
+   * when a playbook-runner skill is served (same library first, else any library); value chains
+   * need no skill, only chain definitions or frontmatter that references them.
+   */
+  private async scanVaults(layouts: Map<string, import("./vault.js").VaultLayout>, skills: Map<string, Skill>, warnings: string[]) {
+    const playbooks = new Map<string, Playbook>();
+    const chains = new Map<string, ValueChain>();
+    const runners = new Map<string, string>();
+    const perLib = new Map<string, { playbooks: number; playbooksHidden: number; runner?: string; valueChains: number; buckets?: number; chainSource?: ValueChain["source"] }>();
+    if (!this.cfg.playbooks && !this.cfg.valueChains) return { playbooks, chains, runners, perLib };
+    const runnerIn = (lib: string) => [...skills.values()].find((s) => s.name === PLAYBOOK_RUNNER && s.library === lib)
+      ?? [...skills.values()].find((s) => s.name === PLAYBOOK_RUNNER);
+    for (const lib of this.cfg.libraries) {
+      const layout = layouts.get(lib.namespace);
+      if (!layout?.vaultRoot) continue;
+      const { vaultRoot, skillsRoot } = layout;
+      try { if (!(await fs.stat(vaultRoot)).isDirectory()) continue; } catch {
+        if (lib.vault) warnings.push(`library '${lib.namespace || "(root)"}': vault directory not found`);
+        continue;
+      }
+      const who = `library '${lib.namespace || "(root)"}'`;
+      const entry: NonNullable<ReturnType<typeof perLib.get>> = { playbooks: 0, playbooksHidden: 0, valueChains: 0 };
+      perLib.set(lib.namespace, entry);
+      const libSkills = [...skills.values()].filter((s) => s.library === lib.namespace);
+
+      let served: Playbook[] = [];
+      if (this.cfg.playbooks) {
+        const pr = await findPlaybookRoots(vaultRoot);
+        if (pr.privateNotes) warnings.push(`${who}: ${pr.privateNotes} note(s) under ${PRIVATE_PLAYBOOK_DIRS.join(", ")} are private playbooks and are not served; only ${PLAYBOOK_DIR} is`);
+        const r = await scanPlaybooks({
+          library: lib.namespace, vaultRoot, roots: pr.roots,
+          excludeDirs: this.cfg.excludeDirs, maxFileBytes: this.cfg.maxFileBytes, mimeFor,
+          showAll: !this.cfg.hideDisabled, skillNames: new Set(libSkills.map((s) => s.name)), prev: this.playbooks,
+        });
+        for (const w of r.warnings) warnings.push(`${who}: ${w}`);
+        const runner = runnerIn(lib.namespace);
+        if (r.playbooks.length + r.hidden.length > 0 && !runner) {
+          warnings.push(`${who}: ${r.playbooks.length + r.hidden.length} playbook(s) found but no '${PLAYBOOK_RUNNER}' skill is served; playbooks withheld`);
+          entry.playbooksHidden = r.playbooks.length + r.hidden.length;
+        } else if (runner) {
+          runners.set(lib.namespace, runner.skillPath);
+          entry.runner = runner.skillPath;
+          served = r.playbooks.filter((p) => !this.tierExcluded(p.frontmatter));
+          this.tierHidden.playbooks += r.playbooks.length - served.length;
+          for (const p of served) playbooks.set(p.playbookPath, p);
+          entry.playbooks = served.length;
+          entry.playbooksHidden = r.hidden.length + (r.playbooks.length - served.length);
+          const known = new Set(libSkills.map((s) => s.name));
+          const missing = new Map<string, string[]>();
+          for (const p of served) for (const sk of p.skills) if (!known.has(sk)) (missing.get(sk) ?? missing.set(sk, []).get(sk)!).push(p.name);
+          for (const [sk, pbs] of missing) warnings.push(`${who}: playbook step names skill '${sk}' which is not served (${pbs.slice(0, 3).join(", ")}${pbs.length > 3 ? `, +${pbs.length - 3} more` : ""})`);
+        }
+      }
+
+      if (this.cfg.valueChains) {
+        const defs = await loadChainDefinitions(vaultRoot, await findChainFiles(vaultRoot, skillsRoot, this.cfg.excludeDirs, this.cfg.ignoreDirs));
+        for (const w of defs.warnings) warnings.push(`${who}: ${w}`);
+        const built = buildValueChains(lib.namespace, defs.defs, defs.source, libSkills.map((s) => ({ name: s.name, valueChains: s.valueChains, stage: coerceString(s.frontmatter["chain-stage"]) })), served);
+        for (const c of built) chains.set(lib.namespace ? `${lib.namespace}/${c.id}` : c.id, c);
+        entry.valueChains = built.length;
+        const buckets = built.filter((c) => c.kind === "bucket").length;
+        if (buckets) entry.buckets = buckets;
+        if (built.length) entry.chainSource = defs.source ?? "derived";
+        const derived = built.filter((c) => c.source === "derived");
+        if (defs.source && derived.length) warnings.push(`${who}: value chain(s) referenced by frontmatter but not defined: ${derived.map((c) => c.id).join(", ")}`);
+      }
+    }
+    return { playbooks, chains, runners, perLib };
   }
 
   private diff(a: Map<string, Skill>, b: Map<string, Skill>): boolean {
@@ -361,7 +682,10 @@ export class Catalog {
     const lib = this.cfg.libraries.find((l) => l.namespace === library);
     const noScripts = !!(this.cfg.noScripts || lib?.noScripts);
     const archives: string[] = [];
-    let files = await this.walk(abs, abs, warnings, [], archives);
+    const skips = newSkips();
+    let files = await this.walk(abs, abs, warnings, [], archives, skips);
+    const skipped = skipWarning(skillPath, skips);
+    if (skipped) warnings.push(skipped);
     if (archives.length) {
       const shown = archives.slice(0, 3).join(", ") + (archives.length > 3 ? `, +${archives.length - 3} more` : "");
       warnings.push(`${skillPath}: bundles archive file(s) (${shown}); skills may not contain archives, skill not served`);
@@ -387,7 +711,7 @@ export class Catalog {
     if (prev && prev.skillMdMtimeMs === st.mtimeMs && prev.scriptsWithheld === scriptsWithheld) {
       for (const f of files) {
         const pf = prev.files.find((p) => p.rel === f.rel);
-        if (pf && pf.mtimeMs === f.mtimeMs && pf.size === f.size) f.digest = pf.digest;
+        if (pf && pf.mtimeMs === f.mtimeMs && pf.size === f.size) { f.digest = pf.digest; f.script = pf.script; }
       }
       const riskFlags = sameFiles || !this.cfg.lint ? (this.cfg.lint ? prev.riskFlags : []) : await lintFiles(files);
       return { ...prev, files, totalBytes, riskFlags };
@@ -421,6 +745,7 @@ export class Catalog {
       tags: [...new Set([...coerceList(fm.tags), ...coerceList(fm["dev-tags"]), ...coerceList(fm["trigger-phrases"])])],
       valueChains: coerceList(fm["value-chains"]),
       requires: coerceList(fm.requires),
+      dependencies: parseDependencies(body, name),
       disabled: fm["disable-model-invocation"] === true || fm["disable-model-invocation"] === "true",
       userInvocable: fm["user-invocable"] !== false && fm["user-invocable"] !== "false",
       frontmatter: fm,
@@ -433,23 +758,30 @@ export class Catalog {
     };
   }
 
-  private async walk(base: string, dir: string, warnings: string[], out: SkillFile[] = [], archives: string[] = []): Promise<SkillFile[]> {
+  private async walk(base: string, dir: string, warnings: string[], out: SkillFile[] = [], archives: string[] = [], skips: Skips = newSkips()): Promise<SkillFile[]> {
     let entries: import("node:fs").Dirent[];
     try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return out; }
+    const relOf = (abs: string) => path.relative(base, abs).split(path.sep).join("/");
     for (const e of entries) {
       const abs = path.join(dir, e.name);
+      // Silently ignored by design: tool and build folders (.venv, node_modules, __pycache__,
+      // .git, caches, *.dist-info, *.egg-info) and compiled artefacts. Everything else that is not
+      // served is counted, so the operator sees it in catalog warnings.
+      if (e.isSymbolicLink()) { skips.symlink.push(relOf(abs)); continue; }
       if (e.isDirectory()) {
-        if (this.cfg.ignoreDirs.has(e.name) || e.name.startsWith(".") || e.name.endsWith(".dist-info") || e.name.endsWith(".egg-info")) continue;
-        await this.walk(base, abs, warnings, out, archives);
+        if (this.cfg.ignoreDirs.has(e.name) || e.name.endsWith(".dist-info") || e.name.endsWith(".egg-info")) continue;
+        if (e.name.startsWith(".")) { skips.dotfile.push(relOf(abs) + "/"); continue; }
+        await this.walk(base, abs, warnings, out, archives, skips);
       } else if (e.isFile()) {
         const ext = path.extname(e.name).toLowerCase();
         // A library may *be* an archive, but nothing inside one may be: archives hide their
         // contents from the linter, so a bundled zip would be served unscanned.
-        if (isArchivePath(e.name)) { archives.push(path.relative(base, abs).split(path.sep).join("/")); continue; }
-        if (this.cfg.ignoreExts.has(ext) || e.name.startsWith(".")) continue;
+        if (isArchivePath(e.name)) { archives.push(relOf(abs)); continue; }
+        if (this.cfg.ignoreExts.has(ext)) continue;
+        if (e.name.startsWith(".")) { skips.dotfile.push(relOf(abs)); continue; }
         let st;
         try { st = await fs.stat(abs); } catch { continue; }
-        if (st.size > this.cfg.maxFileBytes) { continue; }
+        if (st.size > this.cfg.maxFileBytes) { skips.oversize.push(relOf(abs)); continue; }
         out.push({ rel: path.relative(base, abs).split(path.sep).join("/"), abs, size: st.size, mtimeMs: st.mtimeMs, mimeType: mimeFor(e.name) });
       }
       if (out.length > this.cfg.maxFilesPerSkill * 2) break; // hard stop on runaway trees

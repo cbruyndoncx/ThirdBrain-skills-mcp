@@ -21,6 +21,12 @@ export interface Library {
   noScripts?: boolean;
   /** Descriptive metadata shown to clients instead of the root path. */
   info?: LibraryInfo;
+  /**
+   * Vault directory holding this library's playbooks and value chains. By default the library
+   * root itself is inspected (a vault root, or a release zip of one) and nothing outside it is
+   * read; a path here names another directory explicitly, `false` turns the extras off.
+   */
+  vault?: string | false;
 }
 
 /**
@@ -40,9 +46,15 @@ export interface LibraryInfo {
 
 /** Shape of the optional JSON config file (--config). Re-read on every rescan and on SIGHUP. */
 export interface ConfigFile {
-  libraries: ({ namespace: string; root?: string; url?: string; sha256?: string; noScripts?: boolean } & LibraryInfo)[];
+  libraries: ({ namespace: string; root?: string; url?: string; sha256?: string; noScripts?: boolean; vault?: string | false } & LibraryInfo)[];
   noScripts?: boolean;
   lint?: boolean;
+  /** Serve vault playbooks (default true; needs the playbook-runner skill). */
+  playbooks?: boolean;
+  /** Serve vault value chains (default true). */
+  valueChains?: boolean;
+  /** Hide skills and playbooks whose `pricing-tier` is one of these (e.g. ["internal", "private"]). */
+  excludeTiers?: string[] | string;
 }
 
 export interface Config {
@@ -56,6 +68,12 @@ export interface Config {
   noScripts: boolean;
   /** Run the scan-time linter on served files. */
   lint: boolean;
+  /** Serve playbooks found next to a library (when the playbook-runner skill is served). */
+  playbooks: boolean;
+  /** Serve value chains found next to a library. */
+  valueChains: boolean;
+  /** Lowercased `pricing-tier` values whose skills and playbooks are not served (counted as hidden). Empty = serve all. */
+  excludeTiers: Set<string>;
   /** Server name reported in initialize (e.g. "bob-skills"). */
   serverName: string;
   /** Human title reported in initialize. */
@@ -97,15 +115,23 @@ const HELP = `skills-mcp — serve a directory of Agent Skills (SKILL.md folders
 usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefix PREFIX] [--title TITLE] [--http PORT] [--show-disabled] [--stats]
        skills-mcp pull --help        sync skills from any SEP-2640 server to disk
 
-  --config FILE      JSON {libraries:[{namespace,root|url,noScripts?,title?,source?,version?,metadata?}],noScripts?,lint?}
-                     re-read on rescan/SIGHUP                                        env SKILLS_CONFIG
+  --config FILE      JSON {libraries:[{namespace,root|url,noScripts?,vault?,title?,source?,version?,metadata?}],
+                     noScripts?,lint?,playbooks?,valueChains?,excludeTiers?}; re-read on rescan/SIGHUP  env SKILLS_CONFIG
   --no-scripts       withhold executable files (.sh .py .js .ps1 ...) from all manifests      env SKILLS_NO_SCRIPTS=true
   --no-lint          disable the scan-time risk linter                                        env SKILLS_LINT=false
-  --root DIR|ZIP     single un-namespaced library (skill://<skill>/...)          env SKILLS_ROOT
+  --root DIR|ZIP     single un-namespaced library (skill://<skill>/...)          env SKILLS_MCP_ROOT
+                     (SKILLS_ROOT is not read: skills use it for their own folder; BOB_SKILLS_ROOT
+                     is a deprecated alias)
   --lib NS=DIR|ZIP   add a namespaced library (skill://NS/<skill>/...); repeatable env SKILLS_LIBS="bob=/a,gbl=/b.zip"
                      A .zip root is extracted to the cache dir before discovery; archives are
                      never allowed *inside* a library. The value may also be an https URL of a
                      .zip, optionally pinned: https://host/lib.zip#sha256=<64 hex>
+  --vault NS=DIR     explicit vault dir holding NS's playbooks and value chains; by default only the
+                     library root itself is inspected, never folders above or beside it   env SKILLS_VAULTS="bob=/vault"
+  --no-playbooks     never serve playbooks (default: served when found and playbook-runner is served) env SKILLS_PLAYBOOKS=false
+  --no-value-chains  never serve value chains (default: served when found)          env SKILLS_VALUE_CHAINS=false
+  --exclude-tiers T1,T2  hide skills and playbooks whose pricing-tier is listed, e.g. internal,private
+                     (counted as hidden; default: none)                            env SKILLS_EXCLUDE_TIERS
   --name NAME        MCP server name, default "skills"                           env SKILLS_NAME
   --prefix PREFIX    tool-name prefix, default = --name with '-' -> '_'          env SKILLS_TOOL_PREFIX
   --title TITLE      human title, default derived from name                     env SKILLS_TITLE
@@ -120,6 +146,12 @@ usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefi
   env SKILLS_MAX_DOWNLOAD_BYTES (default 256 MiB), SKILLS_FETCH_TIMEOUT_MS (default 60000),
       SKILLS_FETCH_TOKEN (or GH_TOKEN / GITHUB_TOKEN) for private archive assets
 `;
+
+/** Tier list from a comma string or an array, lowercased; empty entries dropped. */
+export function parseTiers(v: string[] | string | undefined): Set<string> {
+  const list = Array.isArray(v) ? v : (v ?? "").split(",");
+  return new Set(list.map((t) => String(t).trim().toLowerCase()).filter(Boolean));
+}
 
 export function validateLibraries(libs: Library[]): void {
   const seen = new Set<string>();
@@ -139,6 +171,10 @@ export function validateLibraries(libs: Library[]): void {
     }
     if (l.namespace && !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(l.namespace)) throw new Error(`library namespace '${l.namespace}' must match [a-zA-Z0-9][a-zA-Z0-9_.-]*`);
     if (l.info) validateInfo(l.namespace, l.info);
+    if (l.vault !== undefined && l.vault !== false) {
+      if (typeof l.vault !== "string" || !l.vault) throw new Error(`library '${l.namespace || "(root)"}': vault must be a directory path or false`);
+      l.vault = path.resolve(l.vault);
+    }
     if (seen.has(l.namespace)) throw new Error(`duplicate library namespace '${l.namespace || "(root)"}'`);
     seen.add(l.namespace);
   }
@@ -175,8 +211,19 @@ export function readConfigFile(file: string): ConfigFile {
   const cf = raw as ConfigFile;
   const base = path.dirname(file);
   // A url library has no root to resolve; String(undefined) would become a bogus "undefined" path.
-  cf.libraries = cf.libraries.map((l) => (l.url ? { ...l } : { ...l, root: path.resolve(base, String(l.root)) }));
+  cf.libraries = cf.libraries.map((l) => {
+    const out = l.url ? { ...l } : { ...l, root: path.resolve(base, String(l.root)) };
+    if (typeof out.vault === "string" && out.vault) out.vault = path.resolve(base, out.vault);
+    return out;
+  });
   return cf;
+}
+
+/** A config-file entry as a Library. */
+function fileLibrary(l: ConfigFile["libraries"][number]): Library {
+  const lib: Library = { namespace: l.namespace, root: l.root ?? "", url: l.url, sha256: l.sha256, noScripts: l.noScripts, info: infoOf(l) };
+  if (l.vault !== undefined) lib.vault = l.vault;
+  return lib;
 }
 
 /**
@@ -186,14 +233,20 @@ export function readConfigFile(file: string): ConfigFile {
 export function reloadConfigFile(cfg: Config, cliLibs: Library[]): boolean {
   if (!cfg.configFile) return false;
   const cf = readConfigFile(cfg.configFile);
-  const next: Library[] = [...cliLibs, ...cf.libraries.map((l) => ({ namespace: l.namespace, root: l.root ?? "", url: l.url, sha256: l.sha256, noScripts: l.noScripts, info: infoOf(l) }))];
+  const next: Library[] = [...cliLibs, ...cf.libraries.map(fileLibrary)];
   validateLibraries(next);
-  const key = (ls: Library[]) => JSON.stringify(ls.map((l) => [l.namespace, l.root, l.url ?? "", l.sha256 ?? "", !!l.noScripts, l.info ?? null]));
-  const changed = key(next) !== key(cfg.libraries) || !!cf.noScripts !== cfg.noScripts || (cf.lint === false) === cfg.lint;
+  const key = (ls: Library[]) => JSON.stringify(ls.map((l) => [l.namespace, l.root, l.url ?? "", l.sha256 ?? "", !!l.noScripts, l.info ?? null, l.vault ?? null]));
+  const tiers = cf.excludeTiers !== undefined ? parseTiers(cf.excludeTiers) : cfg.excludeTiers;
+  const changed = key(next) !== key(cfg.libraries) || !!cf.noScripts !== cfg.noScripts || (cf.lint === false) === cfg.lint
+    || (cf.playbooks === false) === cfg.playbooks || (cf.valueChains === false) === cfg.valueChains
+    || [...tiers].sort().join() !== [...cfg.excludeTiers].sort().join();
   cfg.libraries.splice(0, cfg.libraries.length, ...next);
   cfg.root = next[0].root;
   if (cf.noScripts !== undefined) cfg.noScripts = !!cf.noScripts;
   if (cf.lint !== undefined) cfg.lint = cf.lint !== false;
+  if (cf.playbooks !== undefined) cfg.playbooks = cf.playbooks !== false;
+  if (cf.valueChains !== undefined) cfg.valueChains = cf.valueChains !== false;
+  cfg.excludeTiers = tiers;
   return changed;
 }
 
@@ -222,11 +275,35 @@ function env(name: string): string | undefined {
   return process.env[`SKILLS_${name}`] ?? process.env[`BOB_SKILLS_${name}`]; // BOB_* kept for backward compatibility
 }
 
+let rootAliasWarned = false;
+/**
+ * The un-namespaced root from the environment. `SKILLS_ROOT` is deliberately NOT read: skill
+ * libraries use it as their own contract (the folder their scripts resolve `{skills.root}` from),
+ * so a host that exports it for the skills would otherwise hand the server a second library and
+ * make it refuse to start. `BOB_SKILLS_ROOT` is a deprecated alias.
+ */
+function rootEnv(): string | undefined {
+  if (process.env.SKILLS_MCP_ROOT) return process.env.SKILLS_MCP_ROOT;
+  const old = process.env.BOB_SKILLS_ROOT;
+  if (!old) return undefined;
+  if (!rootAliasWarned) {
+    rootAliasWarned = true;
+    process.stderr.write("[skills-mcp] warning: BOB_SKILLS_ROOT is deprecated, use SKILLS_MCP_ROOT (SKILLS_ROOT is not read: it belongs to the skills' own contract)\n");
+  }
+  return old;
+}
+
 export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
-  let root = env("ROOT");
+  let root = rootEnv();
   let configFile = env("CONFIG");
   let noScripts = (env("NO_SCRIPTS") ?? "false") === "true";
   let lint = (env("LINT") ?? "true") !== "false";
+  let playbooks = (env("PLAYBOOKS") ?? "true") !== "false";
+  let valueChains = (env("VALUE_CHAINS") ?? "true") !== "false";
+  let excludeTiers = parseTiers(env("EXCLUDE_TIERS"));
+  const vaults = new Map<string, string>();
+  const parseVault = (kv: string) => { const i = kv.indexOf("="); if (i < 0) throw new Error(`--vault expects NS=DIR, got '${kv}'`); vaults.set(kv.slice(0, i).trim(), kv.slice(i + 1).trim()); };
+  for (const kv of (env("VAULTS") ?? "").split(",").map((x) => x.trim()).filter(Boolean)) parseVault(kv);
   const libs: Library[] = [];
   for (const kv of (env("LIBS") ?? "").split(",").map((x) => x.trim()).filter(Boolean)) libs.push(parseLib(kv));
   let name = env("NAME");
@@ -246,6 +323,10 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     else if (a === "--config") configFile = next();
     else if (a === "--no-scripts") noScripts = true;
     else if (a === "--no-lint") lint = false;
+    else if (a === "--no-playbooks") playbooks = false;
+    else if (a === "--no-value-chains") valueChains = false;
+    else if (a === "--exclude-tiers") excludeTiers = parseTiers(next());
+    else if (a === "--vault") parseVault(next());
     else if (a === "--name") name = next();
     else if (a === "--prefix") prefix = next();
     else if (a === "--title") title = next();
@@ -261,11 +342,19 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
   if (root) libs.unshift({ namespace: "", ...parseLibValue(root) });
   if (configFile) {
     const cf = readConfigFile(path.resolve(configFile));
-    libs.push(...cf.libraries.map((l) => ({ namespace: l.namespace, root: l.root ?? "", url: l.url, sha256: l.sha256, noScripts: l.noScripts, info: infoOf(l) })));
+    libs.push(...cf.libraries.map(fileLibrary));
     if (cf.noScripts) noScripts = true;
     if (cf.lint === false) lint = false;
+    if (cf.playbooks === false) playbooks = false;
+    if (cf.valueChains === false) valueChains = false;
+    if (cf.excludeTiers !== undefined) excludeTiers = parseTiers(cf.excludeTiers); // the file, when it sets it, wins (as on reload)
   }
-  if (libs.length === 0) throw new Error(`--root DIR, --lib NS=DIR or --config FILE (or SKILLS_ROOT / SKILLS_LIBS / SKILLS_CONFIG) is required.\n${HELP}`);
+  for (const [ns, dir] of vaults) {
+    const lib = libs.find((l) => l.namespace === ns || (ns === "" && !l.namespace));
+    if (!lib) throw new Error(`--vault ${ns}=${dir}: no library named '${ns}'`);
+    lib.vault = dir;
+  }
+  if (libs.length === 0) throw new Error(`--root DIR, --lib NS=DIR or --config FILE (or SKILLS_MCP_ROOT / SKILLS_LIBS / SKILLS_CONFIG) is required.\n${HELP}`);
   validateLibraries(libs);
   name ??= libs.length === 1 && libs[0].namespace ? libs[0].namespace : "skills";
   if (!/^[a-zA-Z0-9_-]+$/.test(name)) throw new Error(`--name must match [a-zA-Z0-9_-]+`);
@@ -278,6 +367,9 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     configFile: configFile ? path.resolve(configFile) : undefined,
     noScripts,
     lint,
+    playbooks,
+    valueChains,
+    excludeTiers,
     serverName: name,
     title: title ?? `${name} (Agent Skills over MCP)`,
     toolPrefix: prefix,

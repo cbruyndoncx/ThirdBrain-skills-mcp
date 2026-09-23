@@ -82,10 +82,10 @@ test("scripts carry origin and approval guidance in get_skill, read_skill_file a
     const text = (g.content as any)[0].text as string;
     assert.match(text, /Source: t \(MCP-served skill, not installed locally\)/);
     assert.match(text, /Bundled scripts are executable content[\s\S]*skills-mcp pull --sync[\s\S]*approval[\s\S]*interpreter/);
-    assert.match(text, /~\/\.cache\/skills-mcp-client\/t\/c\/risky\//, "cache folder per server and skill");
-    assert.match(text, /skills-mcp pull --sync --keep-path --to ~\/\.cache\/skills-mcp-client\/t c\/risky --url/);
-    assert.ok(text.indexOf("skills-mcp pull") < text.indexOf("t_read_skill_file(\"c/risky\", path) for every"), "pull comes before the read_skill_file fallback");
-    assert.match(text, /- scripts\/ok\.py \(\d+ B, sha256:[0-9a-f]{64}\)/, "digests listed when the skill has scripts");
+    assert.match(text, /cd ~\/\.cache\/skills-mcp-client\/t\/c\/risky && SKILLS_ROOT=~\/\.cache\/skills-mcp-client\/t\/c /, "cache folder per server and skill, SKILLS_ROOT at the cached library");
+    assert.match(text, /skills-mcp pull --sync --keep-path --with-deps --to ~\/\.cache\/skills-mcp-client\/t c\/risky --url/);
+    assert.ok(text.indexOf("skills-mcp pull") < text.indexOf("t_read_skill_file(<skill path>, path) for every needed file of \"c/risky\""), "pull comes before the read_skill_file fallback");
+    assert.match(text, /- scripts\/ok\.py \(\d+ B, sha256:[0-9a-f]{64}, run with: python\)/, "digests and interpreter listed when the skill has scripts");
     for (const file of (g.structuredContent as any).files) assert.match(file.digest, /^sha256:[0-9a-f]{64}$/);
     assert.doesNotMatch(text, new RegExp(libC.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "no absolute paths");
     const clean = await client.callTool({ name: "t_get_skill", arguments: { name: "clean" } });

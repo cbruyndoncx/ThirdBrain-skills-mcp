@@ -34,7 +34,7 @@ async function main() {
   // Start scanning now but do not block the transport: initialize answers immediately and
   // the first request waits for the catalog (large libraries on slow disks take 10-30 s).
   const initial = cat.scan();
-  initial.then(() => { const st = cat.getStats(); log(`libraries=${cfg.libraries.map((l) => `${l.namespace || "(root)"}:${l.root}${l.noScripts || cfg.noScripts ? "(no-scripts)" : ""}`).join(",")} lint=${cfg.lint} flagged=${st.flaggedSkills} withheld=${st.scriptsWithheld} skills=${st.skills} hidden=${st.hidden} files=${st.files} bytes=${(st.bytes / 1048576).toFixed(1)}MiB scan=${Date.now() - t0}ms warnings=${st.warnings.length}`); });
+  initial.then(() => { const st = cat.getStats(); log(`libraries=${cfg.libraries.map((l) => `${l.namespace || "(root)"}:${l.root}${l.noScripts || cfg.noScripts ? "(no-scripts)" : ""}`).join(",")} lint=${cfg.lint} flagged=${st.flaggedSkills} withheld=${st.scriptsWithheld} skills=${st.skills} hidden=${st.hidden} files=${st.files} bytes=${(st.bytes / 1048576).toFixed(1)}MiB playbooks=${st.playbooks} valueChains=${st.valueChains} scan=${Date.now() - t0}ms warnings=${st.warnings.length}`); });
 
   if (cfg.statsOnly) {
     await initial;
