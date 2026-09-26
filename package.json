@@ -1,6 +1,6 @@
 {
   "name": "thirdbrain-skills-mcp",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Library-agnostic MCP server for Agent Skills (SKILL.md folders): SEP-2640 skills extension, discovery tools, optional playbooks and value chains, pull and pack clients. Built for ThirdBrain BOB, usable with any skill library.",
   "main": "index.js",
   "scripts": {
