@@ -1,8 +1,10 @@
 /**
  * Vault extras: playbooks and value chains.
  *
- * A ThirdBrain vault (`00-CORE/Agents/skills` plus the folders below) holds two other kinds of
- * information that agents need to chain skills into outcomes:
+ * A library laid out as a ThirdBrain BOB vault (`00-CORE/Agents/skills` plus the folders below)
+ * may hold two other kinds of information that agents need to chain skills into outcomes. The
+ * conventions come from BOB; any library that follows them is served the same way, and one that
+ * does not is served as skills only:
  *
  *  - Playbooks: markdown notes with `type: playbook` frontmatter under `00-CORE/Playbooks/` (the
  *    only folder served; company, personal and client playbook folders are private and only

@@ -1,9 +1,17 @@
 # ThirdBrain skills-mcp
 
 Library-agnostic MCP server that serves one or many directories of **Agent Skills** (`SKILL.md`
-folders, flat or nested) over the Model Context Protocol, each library under its own namespace. Part of the ThirdBrain Business Operating Brain (BOB) tooling.
-Built for the ThirdBrain BOB library (~400 skills) and verified against the GBL library (~400 skills).
-Includes a `pull` client that syncs skills from any SEP-2640 server to disk with digest verification.
+folders, flat or nested) over the Model Context Protocol, each library under its own namespace.
+Any folder of `SKILL.md` directories works: your own skills, a vendor pack, a git checkout, a zip,
+or a GitHub release asset. Optionally it also serves **playbooks** and **value chains** when a
+library ships them. Includes a `pull` client that syncs skills from any SEP-2640 server to disk
+with digest verification, and a `pack` command that builds a distributable zip.
+
+It was built for, and is exercised daily against, the ThirdBrain Business Operating Brain (BOB)
+library (~400 skills) and the GBL library (~400 skills), so the examples use those names and the
+vault folder conventions below come from BOB. Nothing in the server depends on them: a library
+needs only `SKILL.md` folders, and the playbook and value-chain features switch on only when the
+matching folders and files are present.
 
 It implements the **MCP Skills extension ([SEP-2640](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640))**
 for hosts that understand `skill://` resources, and a small set of **discovery tools** for hosts
@@ -29,10 +37,12 @@ skill you pick enters context.
 
 ## Playbooks and value chains
 
-A ThirdBrain vault keeps two more things next to its skills: **playbooks** (multi-step workflows
-that chain skills into an outcome: trigger → numbered AGENT/HUMAN steps → outcome; only the
-vault-shipped ones under `00-CORE/Playbooks/` are served) and **value chains** (end-to-end business journeys such as `lead-to-cash` with ordered stages, to which skills
-and playbooks are mapped). The server serves both when the information is present. The four tools, the
+Optional. A library may ship two more things next to its skills: **playbooks** (multi-step
+workflows that chain skills into an outcome: trigger → numbered AGENT/HUMAN steps → outcome) and
+**value chains** (end-to-end business journeys such as `lead-to-cash` with ordered stages, to which
+skills and playbooks are mapped). The layout and note formats below are the ThirdBrain BOB vault
+conventions; any library that follows them gets the same features, and a library without them is
+served as skills only. The server serves both when the information is present. The four tools, the
 `run-playbook` prompt and the resource templates are always listed (turn them off with
 `--no-playbooks` / `--no-value-chains`), so a host that fetches the tool list once, before the
 first scan finishes, still sees them; when no library ships the content they answer with an empty
