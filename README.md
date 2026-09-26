@@ -32,9 +32,11 @@ skill you pick enters context.
 A ThirdBrain vault keeps two more things next to its skills: **playbooks** (multi-step workflows
 that chain skills into an outcome: trigger → numbered AGENT/HUMAN steps → outcome; only the
 vault-shipped ones under `00-CORE/Playbooks/` are served) and **value chains** (end-to-end business journeys such as `lead-to-cash` with ordered stages, to which skills
-and playbooks are mapped). The server serves both when the information is present, and nothing
-otherwise: the tools, prompt and resource templates only appear when at least one library serves
-them, and hosts are told through `tools/list_changed` after the first scan.
+and playbooks are mapped). The server serves both when the information is present. The four tools, the
+`run-playbook` prompt and the resource templates are always listed (turn them off with
+`--no-playbooks` / `--no-value-chains`), so a host that fetches the tool list once, before the
+first scan finishes, still sees them; when no library ships the content they answer with an empty
+list and a hint that says so.
 
 **The root is the boundary.** The server reads only what is inside the directory, zip or URL you
 give it, never folders above or beside it. So `--lib bob=<vault>/00-CORE/Agents/skills` serves
@@ -126,7 +128,7 @@ git clone https://github.com/cbruyndoncx/ThirdBrain-skills-mcp.git
 cd ThirdBrain-skills-mcp
 npm install
 npm run build
-npm run test:unit   # 94 unit tests (in-memory MCP client, fixtures under test/fixtures)
+npm run test:unit   # 96 unit tests (in-memory MCP client, fixtures under test/fixtures)
 npm test            # smoke test against the BOB library at $BOB_VAULT (prints SKIP when unset)
 npm run test:gbl    # same test against the GBL library at $GBL_VAULT
 npm run test:nested # nested-path fixture (skill://acme/billing/refunds/...)
@@ -162,6 +164,20 @@ Streamable HTTP instead of stdio:
 ```bash
 node dist/index.js --lib bob=DIR --http 3939   # endpoint: http://127.0.0.1:3939/mcp (stateless)
 ```
+
+### Build a distributable pack from a vault
+
+```bash
+node dist/index.js pack --vault /path/to/vault --out bob-2026.09.zip [--wrapper bob-2026.09] [--all-statuses] [--dry-run]
+```
+
+Copies exactly the public content the server serves: `00-CORE/Agents/skills` (with the server's
+ignore rules, skills that bundle an archive left out), the `status: active` playbooks in
+`00-CORE/Playbooks` together with the files they embed, and the canonical
+`20-COMPANY/03-PROCESSES/value-chains.md`. Company, personal and client folders are never read,
+and the generated `VALUE-CHAINS.md` is not shipped because it names private playbooks. The zip is
+deterministic (sorted entries, fixed timestamps) and gets a `.sha256` sidecar; the command prints
+the pinned `--lib` line to give consumers. `pack.json` inside records what was packed.
 
 ### Pull skills from any SEP-2640 server
 
@@ -520,7 +536,8 @@ src/vault.ts        vault extras: playbook discovery/step parsing, value-chain d
 src/server.ts       MCP wiring: extension methods, resources, tools, prompts
 src/lint.ts         scan-time risk linter (labels, never blocks)
 src/pull.ts         client: sync skills from a SEP-2640 server with digest verification
-src/index.ts        entrypoint: `serve` (default; stdio or --http) and `pull`
+src/pack.ts         `pack`: build a distributable zip (skills, active core playbooks, chain file) from a vault
+src/index.ts        entrypoint: `serve` (default; stdio or --http), `pull` and `pack`
 test/unit/*.test.ts unit tests (config, frontmatter, catalog, search, server via InMemoryTransport, pull, hardening, archive, remote, vault, deps, tiers)
 test/smoke.ts       end-to-end test via a real MCP client (parametrised by root/name)
 test/nested.mjs     nested-path + duplicate-name test against test/fixtures/nested

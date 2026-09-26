@@ -41,7 +41,7 @@ test("resources: list/templates/read text+blob/directory", async () => {
     assert.equal(list.resources[0].mimeType, "text/markdown");
     assert.ok((list.resources[0] as any)._meta["io.modelcontextprotocol.skills/category"]);
     const t = await client.listResourceTemplates();
-    assert.equal(t.resourceTemplates.length, 2);
+    assert.equal(t.resourceTemplates.length, 5);
     const txt = await client.readResource({ uri: "skill://b/beta/refs/notes.md" });
     assert.equal((txt.contents[0] as any).text, "notes here\n");
     const bin = await client.readResource({ uri: "skill://b/beta/refs/pic.png" });

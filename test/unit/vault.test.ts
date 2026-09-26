@@ -5,6 +5,8 @@ import { z } from "zod";
 import fs from "node:fs/promises";
 import os from "node:os";
 import { FIX, libA, connected, catalogFor, zipDir } from "./helpers.js";
+// Archive libraries extract into a shared cache that each scan prunes; parallel test processes must not share it.
+process.env.SKILLS_CACHE_DIR = await fs.mkdtemp(path.join(os.tmpdir(), "skills-cache-"));
 import { parseSteps, parseChainDefinitions, buildValueChains, renderValueChain, detectLayout } from "../../src/vault.js";
 
 const vault = path.join(FIX, "vault");
@@ -351,17 +353,36 @@ test("server: tools appear only when served; list/get playbooks; value chains; r
   } finally { await close(); }
 });
 
-test("server: without vault extras the tools, prompt and templates are absent", async () => {
+test("server: tools, prompt and templates are listed whenever the feature is on; they answer empty for a skills-only library; --no-* removes them", async () => {
   const { client, close } = await connected(["--lib", `a=${libA}`, "--name", "plain"]);
   try {
     const tools = (await client.listTools()).tools.map((t) => t.name);
-    assert.ok(!tools.some((t) => /playbook|value_chain/.test(t)));
-    assert.deepEqual((await client.listPrompts()).prompts.map((p) => p.name), ["use-skill"]);
-    assert.equal((await client.listResourceTemplates()).resourceTemplates.length, 2);
-    assert.doesNotMatch(client.getInstructions()!, /playbook/);
-    const r = await client.callTool({ name: "plain_list_playbooks", arguments: {} });
-    assert.equal(r.isError, true);
+    for (const t of ["plain_list_playbooks", "plain_get_playbook", "plain_list_value_chains", "plain_get_value_chain"]) assert.ok(tools.includes(t), t);
+    assert.deepEqual((await client.listPrompts()).prompts.map((p) => p.name), ["use-skill", "run-playbook"]);
+    assert.equal((await client.listResourceTemplates()).resourceTemplates.length, 5);
+    assert.match(client.getInstructions()!, /Playbooks .* are served when a library ships them/);
+    const ls = await client.callTool({ name: "plain_list_playbooks", arguments: {} });
+    assert.equal((ls.structuredContent as any).total, 0);
+    assert.match((ls.structuredContent as any).hint, /No playbooks are served/);
+    const vc = await client.callTool({ name: "plain_list_value_chains", arguments: {} });
+    assert.deepEqual((vc.structuredContent as any).valueChains, []);
+    const g = await client.callTool({ name: "plain_get_playbook", arguments: { name: "x" } });
+    assert.equal(g.isError, true); assert.match(JSON.stringify(g), /No playbooks are served/);
+    const c = await client.callTool({ name: "plain_get_value_chain", arguments: { id: "x" } });
+    assert.equal(c.isError, true);
+    const pr = client.getPrompt({ name: "run-playbook", arguments: { playbook: "x" } });
+    await assert.rejects(pr, /No playbooks are served/);
   } finally { await close(); }
+  const off = await connected(["--lib", `a=${libA}`, "--name", "plain", "--no-playbooks", "--no-value-chains"]);
+  try {
+    const tools = (await off.client.listTools()).tools.map((t) => t.name);
+    assert.ok(!tools.some((t) => /playbook|value_chain/.test(t)));
+    assert.deepEqual((await off.client.listPrompts()).prompts.map((p) => p.name), ["use-skill"]);
+    assert.equal((await off.client.listResourceTemplates()).resourceTemplates.length, 2);
+    assert.doesNotMatch(off.client.getInstructions()!, /playbook/i);
+    const r = await off.client.callTool({ name: "plain_list_playbooks", arguments: {} });
+    assert.equal(r.isError, true);
+  } finally { await off.close(); }
 });
 
 test("portability: a release zip with a wrapper folder serves skills, playbooks and chains; skill paths stay clean", async () => {

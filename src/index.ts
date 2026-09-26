@@ -6,6 +6,7 @@ import { loadConfig, reloadConfigFile } from "./config.js";
 import { Catalog } from "./catalog.js";
 import { createServer } from "./server.js";
 import { parsePullArgs, pull } from "./pull.js";
+import { parsePackArgs, pack } from "./pack.js";
 
 let tag = "skills-mcp";
 const log = (...a: unknown[]) => process.stderr.write(`[${tag}] ${a.join(" ")}\n`);
@@ -18,6 +19,7 @@ async function main() {
     if (!o.list) log(`done: ${r.skills.length} skill(s), ${r.written} file(s) written, ${r.skipped} skipped${o.dryRun ? " (dry run)" : ""}`);
     return;
   }
+  if (argv[0] === "pack") { await pack(parsePackArgs(argv.slice(1))); return; }
   const cfg = loadConfig(argv[0] === "serve" ? argv.slice(1) : argv);
   tag = cfg.serverName;
   // Libraries given on the CLI/env are fixed; those from --config are re-read on every rescan and on SIGHUP.

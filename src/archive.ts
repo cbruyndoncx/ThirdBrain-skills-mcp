@@ -275,15 +275,15 @@ export async function extractZip(zipPath: string, dest: string, limits: ExtractL
       const cap = Math.min(limits.maxEntryBytes, remaining);
       const counter = budgetCounter(cap, `archive entry '${e.name}' exceeds the ${limits.maxTotalBytes} byte extraction budget`, (n) => { written += n; });
 
-      const src = e.compressedSize === 0
-        ? fs.createReadStream(zipPath, { start: 0, end: -1 }) // empty file: read nothing
-        : fs.createReadStream(zipPath, { start: dataStart, end: dataStart + e.compressedSize - 1 });
+      if (e.compressedSize === 0) { // empty file: nothing to stream (a range with end -1 is rejected by Node ≥ 24)
+        await fsp.writeFile(abs, "", { mode: 0o644 });
+        fileCount++;
+        continue;
+      }
+      const src = fs.createReadStream(zipPath, { start: dataStart, end: dataStart + e.compressedSize - 1 });
       const sink = fs.createWriteStream(abs, { mode: 0o644 }); // never executable
 
-      if (e.compressedSize === 0) {
-        src.destroy();
-        await fsp.writeFile(abs, "", { mode: 0o644 });
-      } else if (e.method === 0) {
+      if (e.method === 0) {
         await pipeline(src, counter, sink);
       } else {
         await pipeline(src, zlib.createInflateRaw(), counter, sink);

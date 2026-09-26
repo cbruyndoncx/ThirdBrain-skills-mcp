@@ -114,6 +114,7 @@ const HELP = `skills-mcp — serve a directory of Agent Skills (SKILL.md folders
 
 usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefix PREFIX] [--title TITLE] [--http PORT] [--show-disabled] [--stats]
        skills-mcp pull --help        sync skills from any SEP-2640 server to disk
+       skills-mcp pack --help        build a distributable pack (skills, playbooks, value chains) from a vault
 
   --config FILE      JSON {libraries:[{namespace,root|url,noScripts?,vault?,title?,source?,version?,metadata?}],
                      noScripts?,lint?,playbooks?,valueChains?,excludeTiers?}; re-read on rescan/SIGHUP  env SKILLS_CONFIG

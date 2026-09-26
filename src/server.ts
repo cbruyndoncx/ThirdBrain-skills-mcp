@@ -195,8 +195,8 @@ function vaultLines(cfg: Config, libs: LibraryStats[]): string {
   const playbooks = libs.reduce((n, l) => n + l.playbooks, 0);
   const chains = libs.reduce((n, l) => n + l.valueChains, 0);
   const out: string[] = [];
-  if (playbooks) out.push(`${playbooks} playbooks (multi-step workflows that chain skills into an outcome) are served too: ${p}_list_playbooks(query, value_chain, stage) to find one, ${p}_get_playbook(name) to load its steps. Executing a playbook requires the '${PLAYBOOK_RUNNER}' skill: load it with ${p}_get_skill("${PLAYBOOK_RUNNER}") (or the run-playbook prompt) before running one.`);
-  if (chains) out.push(`${chains} value chains (end-to-end business journeys with ordered stages) map skills and playbooks to stages: ${p}_list_value_chains, then ${p}_get_value_chain(id) for the stage table and coverage gaps.`);
+  if (cfg.playbooks) out.push(`${playbooks ? `${playbooks} playbooks` : "Playbooks"} (multi-step workflows that chain skills into an outcome) ${playbooks ? "are served too" : "are served when a library ships them"}: ${p}_list_playbooks(query, value_chain, stage) to find one, ${p}_get_playbook(name) to load its steps. Executing a playbook requires the '${PLAYBOOK_RUNNER}' skill: load it with ${p}_get_skill("${PLAYBOOK_RUNNER}") (or the run-playbook prompt) before running one.`);
+  if (cfg.valueChains) out.push(`${chains ? `${chains} value chains` : "Value chains"} (end-to-end business journeys with ordered stages) map skills and playbooks to stages: ${p}_list_value_chains, then ${p}_get_value_chain(id) for the stage table and coverage gaps.`);
   return out.length ? out.join("\n") + "\n\n" : "";
 }
 
@@ -327,16 +327,15 @@ export function createServer(cfg: Config, cat: Catalog): Server {
   });
 
   server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
-    const st = cat.getStats();
     const templates = [
       { uriTemplate: "skill://{+skillPath}/SKILL.md", name: "skill", title: "Skill instructions", description: "SKILL.md of a skill by path", mimeType: "text/markdown" },
       { uriTemplate: "skill://{+skillPath}/{+path}", name: "skill-file", title: "Skill bundled file", description: "Any file bundled with a skill (references/, scripts/, templates/, assets/)" },
     ];
-    if (st.playbooks) templates.push(
+    if (cfg.playbooks) templates.push(
       { uriTemplate: "playbook://{+playbookPath}", name: "playbook", title: "Playbook", description: "A vault playbook (multi-step workflow chaining skills) by path: <library>/<name>", mimeType: "text/markdown" },
       { uriTemplate: "playbook://{+playbookPath}/{+file}", name: "playbook-attachment", title: "Playbook attachment", description: "A file embedded by a playbook (sequence diagram, template) that sits next to it" },
     );
-    if (st.valueChains) templates.push({ uriTemplate: "value-chain://{+library}/{id}", name: "value-chain", title: "Value chain", description: "A value chain's stages with the skills and playbooks covering each stage", mimeType: "text/markdown" });
+    if (cfg.valueChains) templates.push({ uriTemplate: "value-chain://{+library}/{id}", name: "value-chain", title: "Value chain", description: "A value chain's stages with the skills and playbooks covering each stage", mimeType: "text/markdown" });
     return { resourceTemplates: templates };
   });
 
@@ -421,9 +420,8 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     required: ["id", "stages", "source", "skills", "playbooks"],
   };
   const vaultTools = (multi: boolean, libDesc: string) => {
-    const st = cat.getStats();
     const out: any[] = [];
-    if (st.playbooks) out.push(
+    if (cfg.playbooks) out.push(
       {
         name: `${P}_list_playbooks`,
         title: `List ${cfg.serverName} playbooks`,
@@ -472,13 +470,13 @@ export function createServer(cfg: Config, cat: Catalog): Server {
         annotations: RO,
       },
     );
-    if (st.valueChains) out.push(
+    if (cfg.valueChains) out.push(
       {
         name: `${P}_list_value_chains`,
         title: `List ${cfg.serverName} value chains`,
         description: "Value chains are end-to-end business journeys (e.g. lead-to-cash) with ordered stages. Lists each chain with its stages and how many skills and playbooks cover it. Use to find the right skill or playbook for a stage of work, or to spot coverage gaps.",
         inputSchema: { type: "object", properties: { library: { type: "string", description: libDesc } } },
-        outputSchema: { type: "object", properties: { valueChains: { type: "array", items: chainSummary } }, required: ["valueChains"] },
+        outputSchema: { type: "object", properties: { valueChains: { type: "array", items: chainSummary }, hint: { type: "string" } }, required: ["valueChains"] },
         annotations: RO,
       },
       {
@@ -667,8 +665,9 @@ export function createServer(cfg: Config, cat: Catalog): Server {
   ];
   };
 
-  // Static skill tools never wait for the scan; playbook and value-chain tools appear once the
-  // first scan has found them (the catalog then sends tools/list_changed).
+  // Static: never waits for the scan. Playbook and value-chain tools are listed whenever the
+  // feature is enabled, so hosts that fetch the tool list once (before the first scan finishes)
+  // still see them; the data decides only what they return.
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: buildTools() }));
 
   /** Structured + text result. Text carries a human rendering (or the JSON) so hosts without structuredContent support still work. */
@@ -770,7 +769,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           return "text" in c ? structured({ ...base, text: c.text }, c.text) : structured({ ...base, base64: c.blob });
         }
         case `${P}_list_playbooks`: {
-          if (!cat.getStats().playbooks) throw new McpError(ErrorCode.MethodNotFound, `No playbooks are served`);
+          if (!cfg.playbooks) throw new McpError(ErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
           let all = cat.allPlaybooks(libFilter(a.library));
           if (a.value_chain) all = all.filter((p) => p.valueChain.toLowerCase() === String(a.value_chain).toLowerCase());
           if (a.stage) all = all.filter((p) => p.chainCoverage.some((c) => c.toLowerCase() === String(a.stage).toLowerCase()));
@@ -779,14 +778,15 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           const { items, nextCursor } = page(ranked, a.cursor, a.limit ?? 50);
           const data: Record<string, unknown> = { total: ranked.length, playbooks: items.map((p) => compactPlaybook(p, cat.playbookRunner(p.library)?.skillPath)) };
           if (nextCursor) data.nextCursor = nextCursor;
-          if (!ranked.length) data.hint = `No playbook matched. Drop filters or call ${P}_list_value_chains to browse by chain.`;
+          if (!ranked.length) data.hint = cat.getStats().playbooks ? `No playbook matched. Drop filters or call ${P}_list_value_chains to browse by chain.` : `No playbooks are served: no library ships a 00-CORE/Playbooks folder with a '${PLAYBOOK_RUNNER}' skill.`;
           const text = (items.map((p) => `- ${p.playbookPath}  [${p.valueChain || "no chain"}${p.chainCoverage.length ? `: ${p.chainCoverage.join(", ")}` : ""}]  ${p.totalSteps} steps\n   Trigger: ${p.trigger || "—"}\n   Outcome: ${p.outcome || "—"}`).join("\n") || "(no playbooks matched)") +
             (nextCursor ? `\n… ${ranked.length - decCursor(a.cursor) - items.length} more; pass cursor "${nextCursor}".` : "") +
             `\n\nNext: ${P}_get_playbook(name). To execute one, load the '${PLAYBOOK_RUNNER}' skill first with ${P}_get_skill.`;
           return structured(data, text);
         }
         case `${P}_get_playbook`: {
-          if (!cat.getStats().playbooks) throw new McpError(ErrorCode.MethodNotFound, `No playbooks are served`);
+          if (!cfg.playbooks) throw new McpError(ErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
+          if (!cat.getStats().playbooks) throw new McpError(ErrorCode.InvalidParams, `No playbooks are served by this server`);
           const p = cat.getPlaybook(String(a.name ?? ""));
           if (!p) throw new McpError(ErrorCode.InvalidParams, `Unknown or ambiguous playbook '${a.name}'. Use ${P}_list_playbooks to find the right name or path.`);
           const runner = cat.playbookRunner(p.library);
@@ -808,14 +808,16 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           return structured(data, text);
         }
         case `${P}_list_value_chains`: {
-          if (!cat.getStats().valueChains) throw new McpError(ErrorCode.MethodNotFound, `No value chains are served`);
+          if (!cfg.valueChains) throw new McpError(ErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
           const chains = cat.allValueChains(libFilter(a.library));
+          if (!chains.length) return structured({ valueChains: [], hint: "No value chains are served: no library ships a value-chains file or frontmatter that references chains." });
           const text = chains.map((c) => `- ${c.library ? `${c.library}/` : ""}${c.id}${c.label ? ` — ${c.label}` : ""}: ${c.kind === "bucket" ? "(bucket: unstaged group)" : c.stages.join(" → ") || "(no stages)"}  [${c.skillCount} skills, ${c.playbookCount} playbooks${c.source === "derived" ? ", derived" : ""}]`).join("\n") +
             `\n\nNext: ${P}_get_value_chain(id) for the stage table.`;
           return structured({ valueChains: chains.map(compactChain) }, text);
         }
         case `${P}_get_value_chain`: {
-          if (!cat.getStats().valueChains) throw new McpError(ErrorCode.MethodNotFound, `No value chains are served`);
+          if (!cfg.valueChains) throw new McpError(ErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
+          if (!cat.getStats().valueChains) throw new McpError(ErrorCode.InvalidParams, `No value chains are served by this server`);
           const c = cat.getValueChain(String(a.id ?? ""), libFilter(a.library));
           if (!c) throw new McpError(ErrorCode.InvalidParams, `Unknown or ambiguous value chain '${a.id}'. Use ${P}_list_value_chains, or pass '<library>/<id>'.`);
           const stageTable = c.stages.map((stage) => ({ stage, skills: c.skillsByStage[stage] ?? [], playbooks: c.playbooksByStage[stage] ?? [] }));
@@ -849,7 +851,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
         { name: "task", description: "What to apply the skill to", required: false },
       ],
     }];
-    if (cat.getStats().playbooks) prompts.push({
+    if (cfg.playbooks) prompts.push({
       name: "run-playbook",
       title: `Run a ${cfg.serverName} playbook`,
       description: `Load the ${PLAYBOOK_RUNNER} skill and a playbook into the conversation and start executing the playbook's steps.`,
@@ -863,7 +865,8 @@ export function createServer(cfg: Config, cat: Catalog): Server {
 
   server.setRequestHandler(GetPromptRequestSchema, async (req) => { await cat.ready();
     if (req.params.name === "run-playbook") {
-      if (!cat.getStats().playbooks) throw new McpError(ErrorCode.InvalidParams, `No playbooks are served`);
+      if (!cfg.playbooks) throw new McpError(ErrorCode.InvalidParams, `Unknown prompt ${req.params.name}`);
+      if (!cat.getStats().playbooks) throw new McpError(ErrorCode.InvalidParams, `No playbooks are served by this server`);
       const p = cat.getPlaybook(String(req.params.arguments?.playbook ?? ""));
       if (!p) throw new McpError(ErrorCode.InvalidParams, `Unknown or ambiguous playbook '${req.params.arguments?.playbook}'. Use ${P}_list_playbooks to find it.`);
       const runner = cat.playbookRunner(p.library);
