@@ -2,12 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { PKG_VERSION } from "./version.js";
 import { z } from "zod";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import {
-  ListResourcesRequestSchema, ListResourceTemplatesRequestSchema, ReadResourceRequestSchema,
-  ListToolsRequestSchema, CallToolRequestSchema, ListPromptsRequestSchema, GetPromptRequestSchema,
-  McpError, ErrorCode,
-} from "@modelcontextprotocol/sdk/types.js";
+import { Server, ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import type { Config, Library, LibraryInfo } from "./config.js";
 import { Catalog, interpreterFor, isTextMime, publicLibrary, type LibraryStats, type ScriptInfo, type Skill, type SkillFile } from "./catalog.js";
 import { searchSkills } from "./search.js";
@@ -25,7 +20,7 @@ const encCursor = (n: number) => Buffer.from(String(n)).toString("base64url");
 const decCursor = (c?: string) => {
   if (!c) return 0;
   const n = Number(Buffer.from(c, "base64url").toString());
-  if (!Number.isInteger(n) || n < 0) throw new McpError(ErrorCode.InvalidParams, "Invalid cursor");
+  if (!Number.isInteger(n) || n < 0) throw new ProtocolError(ProtocolErrorCode.InvalidParams, "Invalid cursor");
   return n;
 };
 function page<T>(items: T[], cursor?: string, size = PAGE): { items: T[]; nextCursor?: string } {
@@ -34,19 +29,23 @@ function page<T>(items: T[], cursor?: string, size = PAGE): { items: T[]; nextCu
   return { items: slice, nextCursor: start + size < items.length ? encCursor(start + size) : undefined };
 }
 
-// ---- SEP-2640 shapes -----------------------------------------------------
-const SkillsListRequestSchema = z.object({
-  method: z.literal("skills/list"),
-  params: z.object({ cursor: z.string().optional(), _meta: z.any().optional() }).passthrough().optional(),
-});
-const SkillsGetRequestSchema = z.object({
-  method: z.literal("skills/get"),
-  params: z.object({ uri: z.string(), _meta: z.any().optional() }).passthrough(),
-});
-const DirectoryReadRequestSchema = z.object({
-  method: z.literal("resources/directory/read"),
-  params: z.object({ uri: z.string(), cursor: z.string().optional(), _meta: z.any().optional() }).passthrough(),
-});
+// ---- SEP-2640 shapes (params of the custom methods; the SDK validates them) ----
+const SkillsListParams = z.object({ cursor: z.string().optional(), _meta: z.any().optional() }).passthrough().optional();
+const SkillsGetParams = z.object({ uri: z.string(), _meta: z.any().optional() }).passthrough();
+const DirectoryReadParams = z.object({ uri: z.string(), cursor: z.string().optional(), _meta: z.any().optional() }).passthrough();
+const AnyResult = z.any();
+
+/** Protocol era a server instance serves: 2025-era (initialize handshake) or 2026-07-28 (per-request envelope). */
+export type Era = "legacy" | "modern";
+
+/**
+ * Cache policy for 2026-07-28 results (SEP-2549). `private`: libraries may be private, so a shared
+ * cache must not reuse a listing across principals. `ttlMs` follows the rescan interval, the longest a
+ * listing can be stale on its own. 2025-era results never carry these fields.
+ */
+export function cachePolicy(cfg: Config): { ttlMs: number; cacheScope: "private" } {
+  return { ttlMs: Math.max(0, cfg.rescanSeconds) * 1000, cacheScope: "private" };
+}
 
 function fileUri(s: Skill, rel: string) {
   return s.uri.replace(/SKILL\.md$/, rel.split("/").map(encodeURIComponent).join("/"));
@@ -137,11 +136,14 @@ function skillMeta(s: Skill): Record<string, unknown> {
 }
 
 function skillResource(s: Skill) {
+  // SEP-2640: the SKILL.md resource's name and description come from the frontmatter, verbatim.
+  // s.description is whitespace-normalised for display; a folded `description: >` differs from it.
+  const fmDescription = typeof s.frontmatter.description === "string" ? s.frontmatter.description : s.description;
   return {
     uri: s.uri,
     name: s.name,
     title: s.name,
-    description: s.description,
+    description: fmDescription,
     mimeType: "text/markdown",
     _meta: skillMeta(s),
   };
@@ -279,8 +281,11 @@ function searchPlaybooks(all: Playbook[], query: string): { playbook: Playbook; 
   return hits.sort((a, b) => b.score - a.score || a.playbook.name.localeCompare(b.playbook.name));
 }
 
-export function createServer(cfg: Config, cat: Catalog): Server {
+export function createServer(cfg: Config, cat: Catalog, era: Era = "legacy"): Server {
   const P = cfg.toolPrefix;
+  const cache = cachePolicy(cfg);
+  /** Cache fields for our custom SEP-2640 results; the SDK adds them to the spec's cacheable results itself. */
+  const cacheFields = era === "modern" ? cache : {};
   const server = new Server(
     { name: cfg.serverName, title: cfg.title, version: PKG_VERSION },
     {
@@ -291,42 +296,50 @@ export function createServer(cfg: Config, cat: Catalog): Server {
         extensions: { [EXTENSION_ID]: { directoryRead: true } },
       },
       instructions: instructionsFor(cfg, cat.getStats()?.skills ?? 0, cat.getStats()?.libraries ?? []),
+      cacheHints: Object.fromEntries(
+        ["tools/list", "prompts/list", "resources/list", "resources/templates/list", "resources/read"].map((m) => [m, cache])
+      ),
     }
   );
 
-  cat.onChange(() => {
+  // One subscription per server instance, released when it closes: HTTP builds an instance per
+  // request and stdio one per connection, so a subscription that outlives its server would leak.
+  const off = cat.onChange(() => {
     server.sendResourceListChanged().catch(() => {});
     server.sendToolListChanged().catch(() => {});
     server.sendPromptListChanged().catch(() => {});
   });
+  const prevOnClose = server.onclose;
+  server.onclose = () => { off(); prevOnClose?.(); };
 
   const requireSkill = (name: string): Skill => {
     const s = cat.get(name) ?? cat.get(name.replace(/^skill:\/\//, "").split("/")[0]);
-    if (!s) throw new McpError(ErrorCode.InvalidParams, `Unknown or ambiguous skill '${name}'. Use ${P}_search_skills to find the right name or path.`);
+    if (!s) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown or ambiguous skill '${name}'. Use ${P}_search_skills to find the right name or path.`);
     return s;
   };
 
   // ---- SEP-2640: skills/list, skills/get ----
-  server.setRequestHandler(SkillsListRequestSchema, async (req) => { await cat.ready();
-    const { items, nextCursor } = page(cat.all(), req.params?.cursor, 50);
+  server.setRequestHandler("skills/list", { params: SkillsListParams, result: AnyResult }, async (params) => { await cat.ready();
+    const { items, nextCursor } = page(cat.all(), params?.cursor, 50);
     const skills = await Promise.all(items.map((s) => skillEntry(cat, s)));
-    return { resultType: "complete", skills, ...(nextCursor ? { nextCursor } : {}) } as any;
+    return { resultType: "complete", skills, ...(nextCursor ? { nextCursor } : {}), ...cacheFields };
   });
 
-  server.setRequestHandler(SkillsGetRequestSchema, async (req) => { await cat.ready();
-    const r = cat.resolveUri(req.params.uri);
-    if (!r || (r.rel && r.rel !== "SKILL.md")) throw new McpError(ErrorCode.InvalidParams, `Not a skill URI: ${req.params.uri}`);
-    return skillEntry(cat, r.skill) as any;
+  // SEP-2640 final: the entry is wrapped as `skill` (the draft returned the bare entry).
+  server.setRequestHandler("skills/get", { params: SkillsGetParams, result: AnyResult }, async (params) => { await cat.ready();
+    const r = cat.resolveUri(params.uri);
+    if (!r || (r.rel && r.rel !== "SKILL.md")) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Not a skill URI: ${params.uri}`);
+    return { skill: await skillEntry(cat, r.skill), ...cacheFields };
   });
 
   // ---- Resources ----
-  server.setRequestHandler(ListResourcesRequestSchema, async (req) => { await cat.ready();
+  server.setRequestHandler('resources/list', async (req) => { await cat.ready();
     const all = [...cat.all().map(skillResource), ...cat.allPlaybooks().map(playbookResource), ...cat.allValueChains().map(valueChainResource)];
     const { items, nextCursor } = page(all, req.params?.cursor);
     return { resources: items, nextCursor };
   });
 
-  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+  server.setRequestHandler('resources/templates/list', async () => {
     const templates = [
       { uriTemplate: "skill://{+skillPath}/SKILL.md", name: "skill", title: "Skill instructions", description: "SKILL.md of a skill by path", mimeType: "text/markdown" },
       { uriTemplate: "skill://{+skillPath}/{+path}", name: "skill-file", title: "Skill bundled file", description: "Any file bundled with a skill (references/, scripts/, templates/, assets/)" },
@@ -339,17 +352,17 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     return { resourceTemplates: templates };
   });
 
-  server.setRequestHandler(ReadResourceRequestSchema, async (req) => { await cat.ready();
+  server.setRequestHandler('resources/read', async (req) => { await cat.ready();
     const pb = cat.resolvePlaybookUri(req.params.uri);
     if (pb) {
       if (!pb.rel) return { contents: [{ uri: pb.playbook.uri, mimeType: "text/markdown", text: await fs.readFile(pb.playbook.abs, "utf8") }] };
-      if (!pb.attachment) throw new McpError(ErrorCode.InvalidParams, `No attachment '${pb.rel}' for playbook '${pb.playbook.name}'`);
+      if (!pb.attachment) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No attachment '${pb.rel}' for playbook '${pb.playbook.name}'`);
       return { contents: [await readContent(pb.attachment, req.params.uri)] };
     }
     const vc = cat.resolveValueChainUri(req.params.uri);
     if (vc) return { contents: [{ uri: vc.uri, mimeType: "text/markdown", text: renderValueChain(vc, P) }] };
     const r = cat.resolveUri(req.params.uri);
-    if (!r) throw new McpError(ErrorCode.InvalidParams, `Unknown resource: ${req.params.uri}`);
+    if (!r) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown resource: ${req.params.uri}`);
     if (!r.rel) { // bare skill:// dir → SKILL.md
       const f = r.skill.files.find((x) => x.rel === "SKILL.md")!;
       return { contents: [await readContent(f, r.skill.uri)] };
@@ -357,7 +370,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     if (!r.file) {
       const isDir = r.skill.files.some((f) => f.rel.startsWith(r.rel + "/"));
       if (isDir) return { contents: [{ uri: req.params.uri, mimeType: "inode/directory", text: JSON.stringify(listDir(r.skill, r.rel)) }] };
-      throw new McpError(ErrorCode.InvalidParams, `File not found in skill '${r.skill.name}': ${r.rel}`);
+      throw new ProtocolError(ProtocolErrorCode.InvalidParams, `File not found in skill '${r.skill.name}': ${r.rel}`);
     }
     return { contents: [await readContent(r.file, req.params.uri)] };
   });
@@ -378,12 +391,12 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  server.setRequestHandler(DirectoryReadRequestSchema, async (req) => { await cat.ready();
-    const r = cat.resolveUri(req.params.uri);
-    if (!r) throw new McpError(ErrorCode.InvalidParams, `Unknown directory: ${req.params.uri}`);
-    if (r.file) throw new McpError(ErrorCode.InvalidParams, `Not a directory: ${req.params.uri}`);
-    const { items, nextCursor } = page(listDir(r.skill, r.rel), req.params.cursor);
-    return { resources: items, ...(nextCursor ? { nextCursor } : {}) } as any;
+  server.setRequestHandler("resources/directory/read", { params: DirectoryReadParams, result: AnyResult }, async (params) => { await cat.ready();
+    const r = cat.resolveUri(params.uri);
+    if (!r) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown directory: ${params.uri}`);
+    if (r.file) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Not a directory: ${params.uri}`);
+    const { items, nextCursor } = page(listDir(r.skill, r.rel), params.cursor);
+    return { resources: items, ...(nextCursor ? { nextCursor } : {}), ...cacheFields };
   });
 
   // ---- Tools (bridge for hosts without the skills extension) ----
@@ -668,7 +681,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
   // Static: never waits for the scan. Playbook and value-chain tools are listed whenever the
   // feature is enabled, so hosts that fetch the tool list once (before the first scan finishes)
   // still see them; the data decides only what they return.
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: buildTools() }));
+  server.setRequestHandler('tools/list', async () => ({ tools: buildTools() }));
 
   /** Structured + text result. Text carries a human rendering (or the JSON) so hosts without structuredContent support still work. */
   const structured = (data: Record<string, unknown>, text?: string) => ({
@@ -678,11 +691,11 @@ export function createServer(cfg: Config, cat: Catalog): Server {
   const libFilter = (lib: unknown): string | undefined => {
     if (lib === undefined || lib === null || lib === "") return undefined;
     const l = String(lib);
-    if (!cfg.libraries.some((x) => x.namespace === l)) throw new McpError(ErrorCode.InvalidParams, `Unknown library '${l}'. Available: ${cfg.libraries.map((x) => x.namespace || "(root)").join(", ")}`);
+    if (!cfg.libraries.some((x) => x.namespace === l)) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown library '${l}'. Available: ${cfg.libraries.map((x) => x.namespace || "(root)").join(", ")}`);
     return l;
   };
 
-  server.setRequestHandler(CallToolRequestSchema, async (req) => { await cat.ready();
+  server.setRequestHandler('tools/call', async (req) => { await cat.ready();
     const a = (req.params.arguments ?? {}) as Record<string, any>;
     try {
       switch (req.params.name) {
@@ -769,7 +782,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           return "text" in c ? structured({ ...base, text: c.text }, c.text) : structured({ ...base, base64: c.blob });
         }
         case `${P}_list_playbooks`: {
-          if (!cfg.playbooks) throw new McpError(ErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
+          if (!cfg.playbooks) throw new ProtocolError(ProtocolErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
           let all = cat.allPlaybooks(libFilter(a.library));
           if (a.value_chain) all = all.filter((p) => p.valueChain.toLowerCase() === String(a.value_chain).toLowerCase());
           if (a.stage) all = all.filter((p) => p.chainCoverage.some((c) => c.toLowerCase() === String(a.stage).toLowerCase()));
@@ -785,10 +798,10 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           return structured(data, text);
         }
         case `${P}_get_playbook`: {
-          if (!cfg.playbooks) throw new McpError(ErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
-          if (!cat.getStats().playbooks) throw new McpError(ErrorCode.InvalidParams, `No playbooks are served by this server`);
+          if (!cfg.playbooks) throw new ProtocolError(ProtocolErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
+          if (!cat.getStats().playbooks) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No playbooks are served by this server`);
           const p = cat.getPlaybook(String(a.name ?? ""));
-          if (!p) throw new McpError(ErrorCode.InvalidParams, `Unknown or ambiguous playbook '${a.name}'. Use ${P}_list_playbooks to find the right name or path.`);
+          if (!p) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown or ambiguous playbook '${a.name}'. Use ${P}_list_playbooks to find the right name or path.`);
           const runner = cat.playbookRunner(p.library);
           const served = new Map(cat.all().filter((s) => s.library === p.library).map((s) => [s.name, s.skillPath]));
           const anyLib = new Map(cat.all().map((s) => [s.name, s.skillPath]));
@@ -808,7 +821,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           return structured(data, text);
         }
         case `${P}_list_value_chains`: {
-          if (!cfg.valueChains) throw new McpError(ErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
+          if (!cfg.valueChains) throw new ProtocolError(ProtocolErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
           const chains = cat.allValueChains(libFilter(a.library));
           if (!chains.length) return structured({ valueChains: [], hint: "No value chains are served: no library ships a value-chains file or frontmatter that references chains." });
           const text = chains.map((c) => `- ${c.library ? `${c.library}/` : ""}${c.id}${c.label ? ` — ${c.label}` : ""}: ${c.kind === "bucket" ? "(bucket: unstaged group)" : c.stages.join(" → ") || "(no stages)"}  [${c.skillCount} skills, ${c.playbookCount} playbooks${c.source === "derived" ? ", derived" : ""}]`).join("\n") +
@@ -816,10 +829,10 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           return structured({ valueChains: chains.map(compactChain) }, text);
         }
         case `${P}_get_value_chain`: {
-          if (!cfg.valueChains) throw new McpError(ErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
-          if (!cat.getStats().valueChains) throw new McpError(ErrorCode.InvalidParams, `No value chains are served by this server`);
+          if (!cfg.valueChains) throw new ProtocolError(ProtocolErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
+          if (!cat.getStats().valueChains) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No value chains are served by this server`);
           const c = cat.getValueChain(String(a.id ?? ""), libFilter(a.library));
-          if (!c) throw new McpError(ErrorCode.InvalidParams, `Unknown or ambiguous value chain '${a.id}'. Use ${P}_list_value_chains, or pass '<library>/<id>'.`);
+          if (!c) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown or ambiguous value chain '${a.id}'. Use ${P}_list_value_chains, or pass '<library>/<id>'.`);
           const stageTable = c.stages.map((stage) => ({ stage, skills: c.skillsByStage[stage] ?? [], playbooks: c.playbooksByStage[stage] ?? [] }));
           const gaps = stageTable.filter((r) => !r.skills.length && !r.playbooks.length).map((r) => r.stage);
           const data = { ...compactChain(c), stageTable, unstaged: { skills: c.skillsByStage[""] ?? [], playbooks: c.playbooksByStage[""] ?? [] }, gaps };
@@ -832,16 +845,16 @@ export function createServer(cfg: Config, cat: Catalog): Server {
           return structured(data);
         }
         default:
-          throw new McpError(ErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
+          throw new ProtocolError(ProtocolErrorCode.MethodNotFound, `Unknown tool ${req.params.name}`);
       }
     } catch (e) {
-      if (e instanceof McpError) return toolResult({ error: e.message }, true);
+      if (e instanceof ProtocolError) return toolResult({ error: e.message }, true);
       throw e;
     }
   });
 
   // ---- Prompts: lets hosts expose "/<server>:use-skill <name>" ----
-  server.setRequestHandler(ListPromptsRequestSchema, async () => {
+  server.setRequestHandler('prompts/list', async () => {
     const prompts: any[] = [{
       name: "use-skill",
       title: `Use a ${cfg.serverName} skill`,
@@ -863,14 +876,14 @@ export function createServer(cfg: Config, cat: Catalog): Server {
     return { prompts };
   });
 
-  server.setRequestHandler(GetPromptRequestSchema, async (req) => { await cat.ready();
+  server.setRequestHandler('prompts/get', async (req) => { await cat.ready();
     if (req.params.name === "run-playbook") {
-      if (!cfg.playbooks) throw new McpError(ErrorCode.InvalidParams, `Unknown prompt ${req.params.name}`);
-      if (!cat.getStats().playbooks) throw new McpError(ErrorCode.InvalidParams, `No playbooks are served by this server`);
+      if (!cfg.playbooks) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown prompt ${req.params.name}`);
+      if (!cat.getStats().playbooks) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No playbooks are served by this server`);
       const p = cat.getPlaybook(String(req.params.arguments?.playbook ?? ""));
-      if (!p) throw new McpError(ErrorCode.InvalidParams, `Unknown or ambiguous playbook '${req.params.arguments?.playbook}'. Use ${P}_list_playbooks to find it.`);
+      if (!p) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown or ambiguous playbook '${req.params.arguments?.playbook}'. Use ${P}_list_playbooks to find it.`);
       const runner = cat.playbookRunner(p.library);
-      if (!runner) throw new McpError(ErrorCode.InvalidParams, `The '${PLAYBOOK_RUNNER}' skill is not served; playbooks cannot be run`);
+      if (!runner) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `The '${PLAYBOOK_RUNNER}' skill is not served; playbooks cannot be run`);
       const inputs = req.params.arguments?.inputs;
       const served = new Map(cat.all().map((s) => [s.name, s.skillPath]));
       const stepLines = p.steps.map((st) => `${st.n}. ${st.skill ? `[${served.get(st.skill) ?? st.skill + " (not served)"}] ` : ""}${st.action}${st.actor ? ` (${st.actor})` : ""}`).join("\n");
@@ -881,7 +894,7 @@ export function createServer(cfg: Config, cat: Catalog): Server {
         `Load each step's skill with ${P}_get_skill(skillPath) when you reach it; ${runner.name}'s bundled files are available via ${P}_read_skill_file("${runner.skillPath}", path).`;
       return { description: `${p.trigger || p.title} → ${p.outcome || "outcome"}`, messages: [{ role: "user", content: { type: "text", text } }] };
     }
-    if (req.params.name !== "use-skill") throw new McpError(ErrorCode.InvalidParams, `Unknown prompt ${req.params.name}`);
+    if (req.params.name !== "use-skill") throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown prompt ${req.params.name}`);
     const s = requireSkill(String(req.params.arguments?.skill ?? ""));
     const task = req.params.arguments?.task;
     const skillFiles = s.files.filter((f) => f.rel !== "SKILL.md");

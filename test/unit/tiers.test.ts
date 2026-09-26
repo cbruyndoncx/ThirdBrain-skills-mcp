@@ -67,7 +67,7 @@ test("--exclude-tiers hides skills and playbooks by pricing-tier (case-insensiti
 
   const { client, close } = await connected(["--lib", `v=${root}`, "--exclude-tiers", "private,internal", "--name", "t"]);
   try {
-    await assert.rejects(client.request({ method: "skills/get", params: { uri: "skill://v/priv/SKILL.md" } }, z.any()), /-32602/);
+    await assert.rejects(client.request({ method: "skills/get", params: { uri: "skill://v/priv/SKILL.md" } }, z.any()), { code: -32602 });
     const status = (await client.callTool({ name: "t_catalog_status", arguments: {} })).structuredContent as any;
     assert.deepEqual(status.tierExcluded, { tiers: ["private", "internal"], skills: 2, playbooks: 1 });
   } finally { await close(); }

@@ -1,5 +1,6 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client } from "@modelcontextprotocol/client";
+
 const t0 = Date.now();
 const c = new Client({ name: "t", version: "0" });
 await c.connect(new StdioClientTransport({ command: "node", args: ["dist/index.js", "--config", "/home/cb/TOOLBOX/MCP/skills.json"], stderr: "ignore" }));

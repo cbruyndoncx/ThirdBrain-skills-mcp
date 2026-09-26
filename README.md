@@ -7,10 +7,13 @@ or a GitHub release asset. Optionally it also serves **playbooks** and **value c
 library ships them. Includes a `pull` client that syncs skills from any SEP-2640 server to disk
 with digest verification, and a `pack` command that builds a distributable zip.
 
-It implements the **MCP Skills extension ([SEP-2640](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640))**
+It implements the **MCP Skills extension ([SEP-2640](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640), Final since 2026-09-13)**
 for hosts that understand `skill://` resources, and a small set of **discovery tools** for hosts
 that do not yet, so skills are loaded on demand instead of being copied into every agent's
-skills folder. The agent flow is progressive disclosure: **search → get_skill → read_skill_file**.
+skills folder. It speaks both protocol revisions from one binary: `2025-11-25` (the `initialize`
+handshake current hosts such as Claude Code use) and `2026-07-28` (`server/discover`, stateless
+per-request envelope), and passes the official conformance suite's skills scenarios on both
+(see [Spec conformance](#spec-conformance-notes)). The agent flow is progressive disclosure: **search → get_skill → read_skill_file**.
 Only the skill you pick enters context.
 
 It was built for, and is exercised daily against, the ThirdBrain Business Operating Brain (BOB)
@@ -141,7 +144,7 @@ the pinned `--lib` line for consumers. Details in [Pack](#build-a-distributable-
 | Surface | Purpose |
 |---|---|
 | `capabilities.extensions["io.modelcontextprotocol/skills"]` | Declares the extension (`directoryRead: true`). |
-| `skills/list` (paginated) / `skills/get` | Skill entries: `uri`, verbatim `frontmatter`, `resources[]` with `sha256` digests and sizes, and `_meta` with `io.modelcontextprotocol.skills/dependencies` (`{required, optional}`: other skills this one runs code from, see [Runtime dependencies](#runtime-dependencies)) and `.../library`. |
+| `skills/list` (paginated) / `skills/get` | `skills/get` returns `{skill: <entry>}` (the final spec's shape). On `2026-07-28` both also carry `ttlMs` (the rescan interval) and `cacheScope: "private"`. Skill entries: `uri`, verbatim `frontmatter`, `resources[]` with `sha256` digests and sizes, and `_meta` with `io.modelcontextprotocol.skills/dependencies` (`{required, optional}`: other skills this one runs code from, see [Runtime dependencies](#runtime-dependencies)) and `.../library`. |
 | `resources/list` | One `text/markdown` resource per skill (`skill://<name>/SKILL.md`), extra frontmatter under `_meta` with the `io.modelcontextprotocol.skills/` prefix. Plus one per served playbook (`playbook://<ns>/<name>`) and value chain (`value-chain://<ns>/<id>`), `_meta` under `io.thirdbrain.vault/`. |
 | `resources/templates/list` | `skill://{+skillPath}/SKILL.md` and `skill://{+skillPath}/{+path}`; `playbook://{+playbookPath}`, `playbook://{+playbookPath}/{+file}` and `value-chain://{+library}/{id}` unless switched off. |
 | `resources/read` | Any bundled file (text, or base64 blob for binaries); a playbook note or an attachment embedded by it; a value chain rendered as a markdown stage table. |
@@ -412,7 +415,11 @@ skills-mcp pull --with-deps --keep-path --sync --to ~/.cache/skills-mcp-client/a
 ```
 
 `pull` walks `skills/list`, reads every file with `resources/read`, verifies each sha256 digest
-against the manifest, refuses paths outside the skill, and writes atomically. `--keep-path` keeps
+against the manifest, refuses paths outside the skill, and writes atomically. It negotiates the
+protocol era (probing with `server/discover`, falling back to the 2025 handshake), so it works
+against servers on either revision, including ones that expose skills only on `2026-07-28`;
+`--legacy-protocol` skips the probe. It accepts both the final `{skill}` and the draft bare-entry
+shape of `skills/get`. `--keep-path` keeps
 the namespace as a folder; `--force` overwrites; `--dry-run` verifies without writing. `--sync`
 updates an existing folder in place: files whose sha256 already matches are kept without a network
 read, changed or missing ones are fetched, and files no longer in the skill are deleted, so a
@@ -588,6 +595,14 @@ to withhold scripts entirely.
 
 ## Spec conformance notes
 
+Measured with the official suite ([modelcontextprotocol/conformance](https://github.com/modelcontextprotocol/conformance),
+commit `7169291`, 2026-09-11), SEP-2640 server scenarios, by `npm run test:conformance`:
+
+| Protocol | enumeration | manifest | directory |
+|---|---|---|---|
+| `2026-07-28` | 32/32 | 6/6 | 7/7 |
+| `2025-11-25` | 30/30 | 6/6 | 7/7 |
+
 * URIs are `skill://<skill-path>/<relative-path>`; the last skill-path segment equals frontmatter `name`.
   A warning is recorded when a directory name and its frontmatter `name` differ.
 * `playbook://` and `value-chain://` are custom schemes, which the MCP resources spec allows
@@ -596,7 +611,12 @@ to withhold scripts entirely.
 * Digests are computed lazily and cached per file `mtime`, so `skills/list` is cheap after the first call.
 * SEP-2640 limits (512 files, 16 MiB per skill) are enforced/flagged: file lists are truncated
   at 512 and oversized skills are listed in `<prefix>_catalog_status include_warnings=true`.
-* `skills/get` answers for hidden (disabled) skills too, as the spec requires.
+* `skills/get` answers for hidden (disabled) skills too, as the spec requires, and wraps the entry
+  as `{skill}`.
+* Cache fields (`ttlMs`, `cacheScope`) are emitted on `2026-07-28` only: by us on `skills/list`,
+  `skills/get` and `resources/directory/read`, and by the SDK (from the same policy) on the spec's
+  cacheable results. `cacheScope` is `private` because libraries may be private.
+* The `SKILL.md` resource's `name` and `description` are the frontmatter values verbatim.
 * A missing resource is a `-32602` error, as the current resources spec requires.
 
 ## Development
@@ -604,10 +624,17 @@ to withhold scripts entirely.
 ```bash
 npm run test:unit   # 96 unit tests (in-memory MCP client, fixtures under test/fixtures)
 npm run test:nested # nested-path fixture (skill://acme/billing/refunds/...)
+npm run test:eras   # stdio with a 2025 client, a pinned 2026-07-28 client and auto negotiation
+npm run test:conformance # official SEP-2640 conformance scenarios over HTTP, both revisions
 npm test            # smoke test against a real library at $BOB_VAULT (prints SKIP when unset)
 npm run test:gbl    # same smoke test against $GBL_VAULT
-npm run test:all
+npm run test:all    # build + all of the above
 ```
+
+Requires Node.js 20+. Built on the TypeScript MCP SDK v2 (`@modelcontextprotocol/server`,
+`client`, `node`). `test:conformance` fetches the conformance suite at a pinned commit and builds
+it once into `~/.cache/skills-mcp` (no npm release contains the skills scenarios yet); set
+`SKILLS_CONFORMANCE_DIR` to use an existing checkout instead.
 
 The vault fixtures under `test/fixtures/vault` and `test/fixtures/vault2` are minimal vaults
 (three skills, playbooks of every status, a private playbook that must never be served, a chain
@@ -626,10 +653,12 @@ src/server.ts       MCP wiring: extension methods, resources, tools, prompts
 src/lint.ts         scan-time risk linter (labels, never blocks)
 src/pull.ts         client: sync skills from a SEP-2640 server with digest verification
 src/pack.ts         `pack`: build a distributable zip (skills, active core playbooks, chain file) from a vault
-src/index.ts        entrypoint: `serve` (default; stdio or --http), `pull` and `pack`
+src/index.ts        entrypoint: `serve` (default; stdio via serveStdio, --http via createMcpHandler; both eras), `pull` and `pack`
 test/unit/*.test.ts unit tests (config, frontmatter, catalog, search, server via InMemoryTransport, pull, hardening, archive, remote, vault, deps, tiers, pack)
 test/smoke.ts       end-to-end test via a real MCP client (parametrised by root/name)
 test/nested.mjs     nested-path + duplicate-name test against test/fixtures/nested
+test/eras.mjs       stdio serving of both protocol eras
+test/conformance.mjs official SEP-2640 conformance scenarios, both revisions
 ```
 
 ## ThirdBrain BOB specifics

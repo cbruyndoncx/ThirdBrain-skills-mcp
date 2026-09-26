@@ -1,5 +1,5 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client } from "@modelcontextprotocol/client";
 import { z } from "zod";
 const c = new Client({ name: "p", version: "0" });
 await c.connect(new StdioClientTransport({ command: "node", args: ["dist/index.js", "--root", process.argv[2], "--name", "demo"], stderr: "pipe" }));

@@ -7,10 +7,9 @@ import { PKG_VERSION } from "./version.js";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import type { Transport } from "@modelcontextprotocol/client";
 
 export interface PullOptions {
   /** Streamable HTTP endpoint of the server, or ... */
@@ -30,6 +29,8 @@ export interface PullOptions {
   /** Update an existing folder in place: keep files whose sha256 matches, fetch the rest, delete files not in the manifest. */
   sync: boolean;
   dryRun: boolean;
+  /** Skip the protocol-era probe and use the 2025 initialize handshake only. */
+  legacyProtocol?: boolean;
   log: (msg: string) => void;
 }
 
@@ -41,6 +42,13 @@ const SkillEntry = z.object({
 });
 const SkillsListResult = z.object({ skills: z.array(SkillEntry), nextCursor: z.string().optional() }).passthrough();
 type SkillEntryT = z.infer<typeof SkillEntry>;
+/** SEP-2640 final wraps the entry as `{skill}`; draft-era servers returned the bare entry. Accept both. */
+const SkillsGetResult = z.union([z.object({ skill: SkillEntry }).passthrough(), SkillEntry]);
+
+async function getSkill(client: Client, uri: string): Promise<SkillEntryT> {
+  const r = await client.request({ method: "skills/get", params: { uri } }, SkillsGetResult);
+  return "skill" in r ? r.skill : r;
+}
 
 const DEPS_KEY = "io.modelcontextprotocol.skills/dependencies";
 const LIBRARY_KEY = "io.modelcontextprotocol.skills/library";
@@ -73,7 +81,10 @@ function makeTransport(o: PullOptions): Transport {
 }
 
 export async function pull(o: PullOptions): Promise<{ written: number; skipped: number; skills: string[] }> {
-  const client = new Client({ name: "skills-mcp-pull", version: PKG_VERSION });
+  // 'auto' probes with server/discover and falls back to the 2025 handshake, so pull works against
+  // 2025-only servers and against servers that expose skills only on 2026-07-28.
+  const client = new Client({ name: "skills-mcp-pull", version: PKG_VERSION },
+    { versionNegotiation: { mode: o.legacyProtocol ? "legacy" : "auto" } });
   await client.connect(makeTransport(o));
   try {
     const caps = client.getServerCapabilities();
@@ -109,7 +120,7 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
       let resources = e.resources;
       if (resources === "dynamic") {
         // Not enumerable up front: re-ask skills/get (servers MUST answer) and fall back to SKILL.md only.
-        const g = await client.request({ method: "skills/get", params: { uri: e.uri } }, SkillEntry);
+        const g = await getSkill(client, e.uri);
         resources = g.resources === "dynamic" ? [{ uri: e.uri, digest: "", size: 0 }] : g.resources;
       }
       const exists = await fs.stat(dest).then(() => true, () => false);
@@ -186,7 +197,7 @@ async function withDependencies(client: Client, entries: SkillEntryT[], selected
         ?? entries.find((x) => lib !== undefined && x._meta?.[LIBRARY_KEY] === lib && (x.frontmatter.name === dep || skillPathOf(x.uri).split("/").pop() === dep));
       if (!hit) {
         const uri = `skill://${sibling.split("/").map(encodeURIComponent).join("/")}/SKILL.md`;
-        hit = await client.request({ method: "skills/get", params: { uri } }, SkillEntry).catch(() => undefined);
+        hit = await getSkill(client, uri).catch(() => undefined);
       }
       if (!hit) throw new Error(`${sp} declares runtime dependency '${dep}', which the server does not serve in the same library; pull without --with-deps to fetch the skill alone`);
       if (seen.has(hit.uri)) continue;
@@ -215,6 +226,7 @@ const PULL_HELP = `skills-mcp pull [skill ...] (--url URL | --command CMD [ARGS.
                      matches (no network read), fetch the rest, delete files not in the skill
   --force            overwrite existing skill folders
   --dry-run          verify digests but write nothing
+  --legacy-protocol  skip the 2026-07-28 probe; use the 2025 initialize handshake only
 `;
 
 async function listFiles(dir: string, base = dir): Promise<string[]> {
@@ -256,6 +268,7 @@ export function parsePullArgs(argv: string[]): PullOptions {
     else if (a === "--force") o.force = true;
     else if (a === "--sync") o.sync = true;
     else if (a === "--dry-run") o.dryRun = true;
+    else if (a === "--legacy-protocol") o.legacyProtocol = true;
     else if (a === "--help" || a === "-h") { process.stderr.write(PULL_HELP); process.exit(0); }
     else if (a.startsWith("--")) throw new Error(`Unknown argument ${a}\n${PULL_HELP}`);
     else o.skills.push(a);

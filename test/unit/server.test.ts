@@ -28,9 +28,9 @@ test("skills/list pages with cursor, entries carry frontmatter + digests; skills
     assert.equal(beta.frontmatter.category, "ops");
     assert.equal(beta.resources.length, 3);
     for (const r of beta.resources) assert.match(r.digest, /^sha256:[0-9a-f]{64}$/);
-    const hidden = await client.request({ method: "skills/get", params: { uri: "skill://b/hidden/SKILL.md" } }, z.any());
+    const hidden = (await client.request({ method: "skills/get", params: { uri: "skill://b/hidden/SKILL.md" } }, z.any())).skill;
     assert.equal(hidden.frontmatter.name, "hidden");
-    await assert.rejects(client.request({ method: "skills/get", params: { uri: "skill://b/nope/SKILL.md" } }, z.any()), /-32602/);
+    await assert.rejects(client.request({ method: "skills/get", params: { uri: "skill://b/nope/SKILL.md" } }, z.any()), { code: -32602 });
   } finally { await close(); }
 });
 test("resources: list/templates/read text+blob/directory", async () => {
@@ -49,7 +49,7 @@ test("resources: list/templates/read text+blob/directory", async () => {
     assert.ok((bin.contents[0] as any).blob.length > 0);
     const dir = await client.request({ method: "resources/directory/read", params: { uri: "skill://b/beta" } }, z.any());
     assert.deepEqual(dir.resources.map((r: any) => [r.name, r.mimeType]).sort(), [["SKILL.md", "text/markdown"], ["refs", "inode/directory"]]);
-    await assert.rejects(client.readResource({ uri: "skill://b/beta/../hidden/SKILL.md" }), /-32602/);
+    await assert.rejects(client.readResource({ uri: "skill://b/beta/../hidden/SKILL.md" }), { code: -32602 });
   } finally { await close(); }
 });
 test("tools: prefix, outputSchema, structuredContent, library filter, ambiguity", async () => {

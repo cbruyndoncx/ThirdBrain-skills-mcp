@@ -330,7 +330,7 @@ test("server: tools appear only when served; list/get playbooks; value chains; r
     assert.equal(png.contents[0].mimeType, "image/png");
     const vc = await client.readResource({ uri: "value-chain://bob/lead-to-cash" });
     assert.match((vc.contents[0] as any).text, /\| `propose` \| cro \| CRO improvement loop \|/);
-    await assert.rejects(client.readResource({ uri: "playbook://bob/CRO%20improvement%20loop/nope.png" }), /-32602/);
+    await assert.rejects(client.readResource({ uri: "playbook://bob/CRO%20improvement%20loop/nope.png" }), { code: -32602 });
 
     const prompts = (await client.listPrompts()).prompts.map((p) => p.name);
     assert.deepEqual(prompts, ["use-skill", "run-playbook"]);

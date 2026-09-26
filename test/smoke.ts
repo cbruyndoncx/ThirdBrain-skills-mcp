@@ -1,5 +1,5 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Client } from "@modelcontextprotocol/client";
 import { z } from "zod";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -39,12 +39,12 @@ while (cursor) { const p = await client.request({ method: "skills/list", params:
 console.log(`✓ skills/list paginated total=${total}, first=${first.frontmatter.name}`);
 
 const got = await client.request({ method: "skills/get", params: { uri: first.uri } }, z.any());
-assert.equal(got.uri, first.uri);
+assert.equal(got.skill.uri, first.uri, "skills/get wraps the entry as {skill}");
 console.log("✓ skills/get");
 
 const res = await client.listResources();
 assert.ok(res.resources.length > 0 && res.resources[0].mimeType === "text/markdown");
-console.log(`✓ resources/list page=${res.resources.length} nextCursor=${!!res.nextCursor}`);
+console.log(`✓ resources/list total=${res.resources.length} (the v2 client aggregates pages)`);
 
 const rd = await client.readResource({ uri: first.uri });
 assert.ok("text" in rd.contents[0] && (rd.contents[0] as any).text.startsWith("---"));

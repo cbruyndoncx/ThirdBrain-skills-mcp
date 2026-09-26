@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import http from "node:http";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { toNodeHandler } from "@modelcontextprotocol/node";
+import { createMcpHandler } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { loadConfig, reloadConfigFile } from "./config.js";
 import { Catalog } from "./catalog.js";
 import { createServer } from "./server.js";
@@ -51,30 +52,25 @@ async function main() {
   }
   process.on("SIGHUP", () => { reload("SIGHUP").catch((e) => log("rescan failed:", e.message)); });
 
+  // Both entries serve 2025-era clients (initialize handshake) and 2026-07-28 clients (server/discover,
+  // per-request envelope) from one factory; the era decides only whether cache fields are emitted.
   if (cfg.http) {
     const { port, host } = cfg.http;
-    const srv = http.createServer(async (req, res) => {
-      if (req.url !== "/mcp") { res.writeHead(404).end(); return; }
-      // Stateless: one server+transport per request; the catalog is shared.
-      const server = createServer(cfg, cat);
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-      res.on("close", () => { transport.close(); server.close(); });
-      await server.connect(transport);
-      let body: unknown = undefined;
-      if (req.method === "POST") {
-        const chunks: Buffer[] = [];
-        for await (const c of req) chunks.push(c as Buffer);
-        const raw = Buffer.concat(chunks).toString("utf8");
-        body = raw ? JSON.parse(raw) : undefined;
-      }
-      await transport.handleRequest(req, res, body);
+    // Stateless: one server instance per request; the catalog is shared.
+    const mcp = toNodeHandler(createMcpHandler(({ era }) => createServer(cfg, cat, era)));
+    const srv = http.createServer((req, res) => {
+      if (req.url?.split("?")[0] !== "/mcp") { res.writeHead(404).end(); return; }
+      Promise.resolve(mcp(req, res)).catch((e) => {
+        log("request failed:", (e as Error)?.message ?? e);
+        if (!res.headersSent) res.writeHead(500).end();
+      });
     });
     srv.listen(port, host, () => log(`listening on http://${host}:${port}/mcp`));
     return;
   }
 
-  const server = createServer(cfg, cat);
-  await server.connect(new StdioServerTransport());
+  // One instance per connection, pinned to the era the client opened with.
+  serveStdio(({ era }) => createServer(cfg, cat, era));
   log("ready on stdio");
 }
 

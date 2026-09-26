@@ -90,7 +90,7 @@ test("_meta dependencies in skills/list, skills/get and resources/list; get_skil
     const app = list.skills.find((s: any) => s.uri === "skill://x/app/SKILL.md");
     assert.deepEqual(app._meta["io.modelcontextprotocol.skills/dependencies"], { required: ["core"], optional: ["extra"] });
     assert.equal(app._meta["io.modelcontextprotocol.skills/library"], "x");
-    const got = await client.request({ method: "skills/get", params: { uri: "skill://x/core/SKILL.md" } }, z.any());
+    const got = (await client.request({ method: "skills/get", params: { uri: "skill://x/core/SKILL.md" } }, z.any())).skill;
     assert.deepEqual(got._meta["io.modelcontextprotocol.skills/dependencies"], { required: ["util", "app"], optional: [] });
     const res = await client.listResources();
     const r = res.resources.find((x) => x.uri === "skill://x/app/SKILL.md") as any;
