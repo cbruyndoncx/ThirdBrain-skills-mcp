@@ -127,7 +127,7 @@ test("zip slip: absolute entry path is rejected", async () => {
 });
 
 test("symlink entries are rejected", async () => {
-  await rejects([{ name: "s/link", data: "/home/cb/.ssh/id_rsa", unixMode: 0o120777 }], /is a symlink/);
+  await rejects([{ name: "s/link", data: "/home/user/.ssh/id_rsa", unixMode: 0o120777 }], /is a symlink/);
 });
 
 test("encrypted entries are rejected", async () => {

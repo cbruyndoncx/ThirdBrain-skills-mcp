@@ -652,6 +652,8 @@ npm run test:eras   # stdio with a 2025 client, a pinned 2026-07-28 client and a
 npm run test:conformance # official SEP-2640 conformance scenarios over HTTP, both revisions
 npm test            # smoke test against a real library at $BOB_VAULT (prints SKIP when unset)
 npm run test:gbl    # same smoke test against $GBL_VAULT
+npm run test:startup # time initialize + first tool call against $SKILLS_CONFIG or $BOB_VAULT (SKIP when unset);
+                     # or pass server args: node test/startup-timing.mjs --lib bob=/path/to/vault
 npm run test:all    # build + all of the above
 ```
 
@@ -682,6 +684,7 @@ test/unit/*.test.ts unit tests (config, frontmatter, catalog, search, server via
 test/smoke.ts       end-to-end test via a real MCP client (parametrised by root/name)
 test/nested.mjs     nested-path + duplicate-name test against test/fixtures/nested
 test/eras.mjs       stdio serving of both protocol eras
+test/startup-timing.mjs time to initialize and first tool call against a real library
 test/conformance.mjs official SEP-2640 conformance scenarios, both revisions
 ```
 
@@ -709,9 +712,9 @@ claude mcp add --scope user skills -- node /path/to/ThirdBrain-skills-mcp/dist/i
 ```
 
 This repository's `.mcp.json` does the same for one library: `node ${PWD}/dist/index.js --lib
-bob=${BOB_VAULT:-/mnt/c/users/bruyn/documents/brncx-skills}`, so it works when the MCP client is
-started in the repository folder after `npm run build`; set `BOB_VAULT` to point it at another
-vault. The smoke tests read `BOB_VAULT` and `GBL_VAULT` the same way.
+bob=${BOB_VAULT}`, so it works when the MCP client is started in the repository folder after
+`npm run build` with `BOB_VAULT` set to the vault root. The smoke tests read `BOB_VAULT` and
+`GBL_VAULT` the same way, and `test:startup` reads `SKILLS_CONFIG` or `BOB_VAULT`.
 
 **Serving a release pack in a new vault.** Build the pack from the live vault, then reference it
 from the new vault's `.mcp.json`:

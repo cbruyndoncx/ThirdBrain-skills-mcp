@@ -3,7 +3,7 @@
     "skills": {
       "command": "node",
       "args": ["${PWD}/dist/index.js",
-               "--lib", "bob=${BOB_VAULT:-/mnt/c/users/bruyn/documents/brncx-skills}"]
+               "--lib", "bob=${BOB_VAULT}"]
     }
   }
 }

@@ -15,7 +15,8 @@
     "test:all": "npm run build && npm run test:unit && npm run test:nested && npm run test:eras && npm run test:conformance && npm test",
     "prepare": "npm run build",
     "test:conformance": "node test/conformance.mjs",
-    "test:eras": "node test/eras.mjs"
+    "test:eras": "node test/eras.mjs",
+    "test:startup": "node test/startup-timing.mjs"
   },
   "keywords": [
     "mcp",
