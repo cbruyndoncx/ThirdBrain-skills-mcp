@@ -92,6 +92,7 @@ const SIG_CD = 0x02014b50;
 const SIG_LOCAL = 0x04034b50;
 const EOCD_MIN = 22;
 const MAX_COMMENT = 0xffff;
+const INTEGRITY_FILE = ".skills-mcp-integrity.json";
 
 export function defaultCacheRoot(): string {
   const xdg = process.env.XDG_CACHE_HOME;
@@ -228,6 +229,7 @@ export async function extractZip(zipPath: string, dest: string, limits: ExtractL
     // Validate everything before writing a single byte, so a bad archive leaves no partial tree.
     let declaredTotal = 0;
     for (const e of entries) {
+      if (e.name === INTEGRITY_FILE) throw new ArchiveError(`archive entry '${e.name}' is reserved`);
       if (e.flags & 0x1) throw new ArchiveError(`archive entry '${e.name}' is encrypted`);
       if ((e.unixMode & 0xf000) === 0xa000) throw new ArchiveError(`archive entry '${e.name}' is a symlink`);
       if (e.isDir) continue;
@@ -296,6 +298,31 @@ export async function extractZip(zipPath: string, dest: string, limits: ExtractL
   }
 }
 
+async function treeHashes(root: string): Promise<Record<string, string>> {
+  const files: Record<string, string> = {};
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await fsp.readdir(dir, { withFileTypes: true })) {
+      if (dir === root && entry.name === INTEGRITY_FILE) continue;
+      const abs = path.join(dir, entry.name);
+      if (entry.isDirectory()) await walk(abs);
+      else if (entry.isFile()) files[path.relative(root, abs).split(path.sep).join("/")] = await sha256File(abs);
+      else throw new ArchiveError(`cached extraction contains a non-regular entry: ${abs}`);
+    }
+  };
+  await walk(root);
+  return files;
+}
+
+/** Verify cached extracted files before they are served after a process restart. */
+export async function verifyExtraction(dir: string): Promise<void> {
+  let expected: Record<string, string>;
+  try { expected = JSON.parse(await fsp.readFile(path.join(dir, INTEGRITY_FILE), "utf8")); }
+  catch { throw new ArchiveError(`cached extraction ${dir} has no integrity record; remove this cache entry`); }
+  const actual = await treeHashes(dir);
+  const sorted = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
+  if (sorted(actual) !== sorted(expected)) throw new ArchiveError(`cached extraction ${dir} changed on disk; remove this cache entry`);
+}
+
 /**
  * Resolve an archive library root to a directory of files, extracting it if this exact archive
  * (by content digest) has not been extracted before. Extraction goes to a temp sibling and is
@@ -307,13 +334,16 @@ export async function extractLibrary(zipPath: string, cacheRoot: string, limits:
   const dir = path.join(cacheRoot, digest);
   try {
     const st = await fsp.stat(dir);
-    if (st.isDirectory()) return { dir, digest, entries: 0, bytes: 0, cached: true, ms: Date.now() - t0 };
-  } catch { /* not cached yet */ }
+    if (st.isDirectory()) { await verifyExtraction(dir); return { dir, digest, entries: 0, bytes: 0, cached: true, ms: Date.now() - t0 }; }
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
 
   await fsp.mkdir(cacheRoot, { recursive: true });
   const tmp = path.join(cacheRoot, `.tmp-${digest.slice(0, 12)}-${randomBytes(4).toString("hex")}`);
   try {
     const { entries, bytes } = await extractZip(zipPath, tmp, limits);
+    await fsp.writeFile(path.join(tmp, INTEGRITY_FILE), JSON.stringify(await treeHashes(tmp)), { mode: 0o600 });
     try {
       await fsp.rename(tmp, dir);
     } catch (e) {

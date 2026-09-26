@@ -64,6 +64,8 @@ export interface Config {
   root: string;
   /** Path of the JSON config file, when libraries come from one. */
   configFile?: string;
+  /** Policy fixed by CLI/env and reapplied whenever the config file is reloaded. */
+  fixedPolicy?: { noScripts: boolean; lint: boolean; playbooks: boolean; valueChains: boolean };
   /** Withhold executable files from every library. */
   noScripts: boolean;
   /** Run the scan-time linter on served files. */
@@ -145,7 +147,7 @@ usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefi
   env SKILLS_CACHE_DIR (default ~/.cache/skills-mcp), SKILLS_MAX_ARCHIVE_BYTES (default 256 MiB),
       SKILLS_MAX_ARCHIVE_ENTRIES (default 8192)
   env SKILLS_MAX_DOWNLOAD_BYTES (default 256 MiB), SKILLS_FETCH_TIMEOUT_MS (default 60000),
-      SKILLS_FETCH_TOKEN (or GH_TOKEN / GITHUB_TOKEN) for private archive assets
+      SKILLS_FETCH_TOKEN for private archive assets (GH_TOKEN / GITHUB_TOKEN apply to GitHub hosts only)
 `;
 
 /** Tier list from a comma string or an array, lowercased; empty entries dropped. */
@@ -213,7 +215,8 @@ export function readConfigFile(file: string): ConfigFile {
   const base = path.dirname(file);
   // A url library has no root to resolve; String(undefined) would become a bogus "undefined" path.
   cf.libraries = cf.libraries.map((l) => {
-    const out = l.url ? { ...l } : { ...l, root: path.resolve(base, String(l.root)) };
+    if (!l || typeof l.namespace !== "string" || (!l.url && (typeof l.root !== "string" || !l.root))) throw new Error(`config ${file}: each library needs a namespace and root or url`);
+    const out = l.url ? { ...l } : { ...l, root: path.resolve(base, l.root!) };
     if (typeof out.vault === "string" && out.vault) out.vault = path.resolve(base, out.vault);
     return out;
   });
@@ -235,18 +238,24 @@ export function reloadConfigFile(cfg: Config, cliLibs: Library[]): boolean {
   if (!cfg.configFile) return false;
   const cf = readConfigFile(cfg.configFile);
   const next: Library[] = [...cliLibs, ...cf.libraries.map(fileLibrary)];
+  if (!next.length) throw new Error(`config ${cfg.configFile}: at least one library is required`);
   validateLibraries(next);
   const key = (ls: Library[]) => JSON.stringify(ls.map((l) => [l.namespace, l.root, l.url ?? "", l.sha256 ?? "", !!l.noScripts, l.info ?? null, l.vault ?? null]));
+  const fixed = cfg.fixedPolicy;
+  const noScripts = !!(fixed?.noScripts || cf.noScripts);
+  const lint = !!(fixed?.lint && cf.lint !== false);
+  const playbooks = !!(fixed?.playbooks && cf.playbooks !== false);
+  const valueChains = !!(fixed?.valueChains && cf.valueChains !== false);
   const tiers = cf.excludeTiers !== undefined ? parseTiers(cf.excludeTiers) : cfg.excludeTiers;
-  const changed = key(next) !== key(cfg.libraries) || !!cf.noScripts !== cfg.noScripts || (cf.lint === false) === cfg.lint
-    || (cf.playbooks === false) === cfg.playbooks || (cf.valueChains === false) === cfg.valueChains
+  const changed = key(next) !== key(cfg.libraries) || noScripts !== cfg.noScripts || lint !== cfg.lint
+    || playbooks !== cfg.playbooks || valueChains !== cfg.valueChains
     || [...tiers].sort().join() !== [...cfg.excludeTiers].sort().join();
   cfg.libraries.splice(0, cfg.libraries.length, ...next);
   cfg.root = next[0].root;
-  if (cf.noScripts !== undefined) cfg.noScripts = !!cf.noScripts;
-  if (cf.lint !== undefined) cfg.lint = cf.lint !== false;
-  if (cf.playbooks !== undefined) cfg.playbooks = cf.playbooks !== false;
-  if (cf.valueChains !== undefined) cfg.valueChains = cf.valueChains !== false;
+  cfg.noScripts = noScripts;
+  cfg.lint = lint;
+  cfg.playbooks = playbooks;
+  cfg.valueChains = valueChains;
   cfg.excludeTiers = tiers;
   return changed;
 }
@@ -341,6 +350,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
   }
   // --root accepts a directory, a .zip, or an https URL (with an optional #sha256= pin).
   if (root) libs.unshift({ namespace: "", ...parseLibValue(root) });
+  const fixedPolicy = { noScripts, lint, playbooks, valueChains };
   if (configFile) {
     const cf = readConfigFile(path.resolve(configFile));
     libs.push(...cf.libraries.map(fileLibrary));
@@ -348,7 +358,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     if (cf.lint === false) lint = false;
     if (cf.playbooks === false) playbooks = false;
     if (cf.valueChains === false) valueChains = false;
-    if (cf.excludeTiers !== undefined) excludeTiers = parseTiers(cf.excludeTiers); // the file, when it sets it, wins (as on reload)
+    if (cf.excludeTiers !== undefined) excludeTiers = parseTiers(cf.excludeTiers);
   }
   for (const [ns, dir] of vaults) {
     const lib = libs.find((l) => l.namespace === ns || (ns === "" && !l.namespace));
@@ -366,6 +376,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     libraries: libs,
     root: libs[0].root,
     configFile: configFile ? path.resolve(configFile) : undefined,
+    fixedPolicy,
     noScripts,
     lint,
     playbooks,
@@ -385,7 +396,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     cacheDir: env("CACHE_DIR") ? path.resolve(env("CACHE_DIR")!) : defaultCacheRoot(),
     maxDownloadBytes: Number(env("MAX_DOWNLOAD_BYTES") ?? 256 * 1024 * 1024),
     fetchTimeoutMs: Number(env("FETCH_TIMEOUT_MS") ?? 60_000),
-    fetchToken: env("FETCH_TOKEN") ?? process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN,
+    fetchToken: env("FETCH_TOKEN"),
     archiveLimits: {
       ...DEFAULT_LIMITS,
       maxTotalBytes: Number(env("MAX_ARCHIVE_BYTES") ?? DEFAULT_LIMITS.maxTotalBytes),

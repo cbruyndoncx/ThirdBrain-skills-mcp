@@ -26,8 +26,11 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
+import { constants } from "node:fs";
 import { createHash } from "node:crypto";
 import { splitFrontmatter, coerceString, coerceList } from "./frontmatter.js";
+import { isArchivePath } from "./archive.js";
+import { SCRIPT_EXTENSIONS } from "./lint.js";
 
 /**
  * The only playbook folder that is served: the vault-shipped library. Company, personal and client
@@ -151,7 +154,15 @@ export interface VaultLayout {
 }
 
 async function isDir(p: string): Promise<boolean> {
-  try { return (await fs.stat(p)).isDirectory(); } catch { return false; }
+  try { return (await fs.lstat(p)).isDirectory(); } catch { return false; }
+}
+
+async function regularWithin(root: string, file: string): Promise<boolean> {
+  try {
+    if (!(await fs.lstat(file)).isFile()) return false;
+    const base = await fs.realpath(root), resolved = await fs.realpath(file);
+    return resolved.startsWith(base + path.sep);
+  } catch { return false; }
 }
 
 async function hasMarkers(root: string, excludeDirs: Set<string>, ignoreDirs: Set<string>): Promise<boolean> {
@@ -219,7 +230,7 @@ export async function findPlaybookRoots(vaultRoot: string): Promise<{ roots: str
 /** Candidate chain definition files, in preference order: the conventional paths, then any found by walking. */
 export async function findChainFiles(vaultRoot: string, skillsRoot: string, excludeDirs: Set<string>, ignoreDirs: Set<string>): Promise<string[]> {
   const known: string[] = [];
-  for (const rel of VALUE_CHAIN_FILES) { const abs = path.join(vaultRoot, rel); try { if ((await fs.stat(abs)).isFile()) known.push(abs); } catch { /* absent */ } }
+  for (const rel of VALUE_CHAIN_FILES) { const abs = path.join(vaultRoot, rel); if (await regularWithin(vaultRoot, abs)) known.push(abs); }
   const found = (await walkFiles(vaultRoot, vaultRoot, excludeDirs, ignoreDirs, (n) => CHAIN_FILE_RE.test(n), 1, [], skillsRoot)).filter((f) => !known.includes(f)).sort();
   return [...known, ...found];
 }
@@ -424,11 +435,12 @@ function phaseSteps(lines: string[], isSkill?: (name: string) => boolean): Playb
 const EMBED_RE = /!\[\[([^\]|#]+?)(?:[|#][^\]]*)?\]\]/g;
 
 async function statAttachment(dir: string, name: string, mimeFor: (f: string) => string, maxBytes: number): Promise<PlaybookAttachment | null> {
-  if (name.includes("/") || name.includes("\\") || name.includes("..")) return null;
+  if (name.includes("/") || name.includes("\\") || name.includes("..") || name.startsWith(".") || isArchivePath(name)) return null;
   const abs = path.join(dir, name);
   try {
-    const st = await fs.stat(abs);
+    const st = await fs.lstat(abs);
     if (!st.isFile() || st.size > maxBytes) return null;
+    if (path.dirname(await fs.realpath(abs)) !== await fs.realpath(dir)) return null;
     return { rel: name, abs, size: st.size, mtimeMs: st.mtimeMs, mimeType: mimeFor(name) };
   } catch { return null; }
 }
@@ -440,6 +452,7 @@ export interface PlaybookScanOpts {
   roots: string[];
   excludeDirs: Set<string>;
   maxFileBytes: number;
+  noScripts?: boolean;
   mimeFor: (f: string) => string;
   /** Serve every status, not only `active`. */
   showAll: boolean;
@@ -501,6 +514,7 @@ export async function scanPlaybooks(o: PlaybookScanOpts): Promise<{ playbooks: P
       const embeds = new Set<string>();
       for (const m of body.matchAll(EMBED_RE)) embeds.add(m[1].trim());
       for (const name of embeds) {
+        if (o.noScripts && SCRIPT_EXTENSIONS.test(name)) continue;
         const a = await statAttachment(path.dirname(f.abs), name, o.mimeFor, o.maxFileBytes);
         if (a) attachments.push(a);
       }
@@ -549,17 +563,21 @@ export async function scanPlaybooks(o: PlaybookScanOpts): Promise<{ playbooks: P
 
 async function refreshAttachments(prev: Playbook, o: PlaybookScanOpts): Promise<PlaybookAttachment[]> {
   const out: PlaybookAttachment[] = [];
-  for (const a of prev.attachments) {
-    const fresh = await statAttachment(path.dirname(prev.abs), a.rel, o.mimeFor, o.maxFileBytes);
+  for (const match of prev.body.matchAll(EMBED_RE)) {
+    const name = match[1].trim();
+    if (out.some((a) => a.rel === name) || o.noScripts && SCRIPT_EXTENSIONS.test(name)) continue;
+    const fresh = await statAttachment(path.dirname(prev.abs), name, o.mimeFor, o.maxFileBytes);
     if (!fresh) continue;
-    out.push(fresh.mtimeMs === a.mtimeMs && fresh.size === a.size ? a : fresh);
+    const old = prev.attachments.find((a) => a.rel === name);
+    out.push(old && fresh.mtimeMs === old.mtimeMs && fresh.size === old.size ? old : fresh);
   }
   return out;
 }
 
 export async function digestOf(f: { abs: string; digest?: string }): Promise<string> {
   if (f.digest) return f.digest;
-  const buf = await fs.readFile(f.abs);
+  const handle = await fs.open(f.abs, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const buf = await handle.readFile().finally(() => handle.close());
   f.digest = "sha256:" + createHash("sha256").update(buf).digest("hex");
   return f.digest;
 }

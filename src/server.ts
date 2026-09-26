@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { constants } from "node:fs";
 import { PKG_VERSION } from "./version.js";
 import { z } from "zod";
 import { Server, ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
@@ -174,7 +175,8 @@ function toolResult(payload: unknown, isError = false) {
 }
 
 async function readContent(f: Pick<SkillFile, "abs" | "mimeType">, uri: string) {
-  const buf = await fs.readFile(f.abs);
+  const handle = await fs.open(f.abs, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const buf = await handle.readFile().finally(() => handle.close());
   return isTextMime(f.mimeType)
     ? { uri, mimeType: f.mimeType, text: buf.toString("utf8") }
     : { uri, mimeType: f.mimeType, blob: buf.toString("base64") };
@@ -355,7 +357,7 @@ export function createServer(cfg: Config, cat: Catalog, era: Era = "legacy"): Se
   server.setRequestHandler('resources/read', async (req) => { await cat.ready();
     const pb = cat.resolvePlaybookUri(req.params.uri);
     if (pb) {
-      if (!pb.rel) return { contents: [{ uri: pb.playbook.uri, mimeType: "text/markdown", text: await fs.readFile(pb.playbook.abs, "utf8") }] };
+      if (!pb.rel) return { contents: [await readContent({ abs: pb.playbook.abs, mimeType: "text/markdown" }, pb.playbook.uri)] };
       if (!pb.attachment) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `No attachment '${pb.rel}' for playbook '${pb.playbook.name}'`);
       return { contents: [await readContent(pb.attachment, req.params.uri)] };
     }

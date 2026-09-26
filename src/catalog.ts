@@ -1,13 +1,14 @@
 import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { constants } from "node:fs";
 import type { Config, LibraryInfo, Library } from "./config.js";
 
 interface Discovered { skillPath: string; abs: string; library: string }
 import { splitFrontmatter, coerceString, coerceList } from "./frontmatter.js";
 import { lintFiles, SCRIPT_EXTENSIONS, type LintFinding } from "./lint.js";
-import { extractLibrary, pruneCache, isArchivePath } from "./archive.js";
-import { fetchArchive, pruneDownloads, redact } from "./remote.js";
+import { extractLibrary, isArchivePath, verifyExtraction } from "./archive.js";
+import { fetchArchive, redact } from "./remote.js";
 import {
   detectLayout, findPlaybookRoots, findChainFiles, scanPlaybooks, loadChainDefinitions, buildValueChains, digestOf, PLAYBOOK_RUNNER, PLAYBOOK_DIR, PRIVATE_PLAYBOOK_DIRS,
   type Playbook, type PlaybookAttachment, type ValueChain,
@@ -384,7 +385,8 @@ export class Catalog {
 
   async digestFor(f: SkillFile): Promise<string> {
     if (f.digest) return f.digest;
-    const buf = await fs.readFile(f.abs);
+    const handle = await fs.open(f.abs, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const buf = await handle.readFile().finally(() => handle.close());
     f.digest = "sha256:" + createHash("sha256").update(buf).digest("hex");
     return f.digest;
   }
@@ -403,6 +405,7 @@ export class Catalog {
 
   private async doScan(): Promise<void> {
     const t0 = Date.now();
+    const previousLibraries = this.stats?.libraries ?? [];
     const warnings: string[] = [];
     this.archiveRejected = 0;
     this.tierHidden = { skills: new Map(), playbooks: 0 };
@@ -429,20 +432,18 @@ export class Catalog {
           continue;
         }
       }
-      const layout = await detectLayout(effectiveRoot, this.cfg.playbooks || this.cfg.valueChains ? lib.vault : false, this.cfg.excludeDirs, this.cfg.ignoreDirs);
+      const layout = await detectLayout(effectiveRoot, lib.vault, this.cfg.excludeDirs, this.cfg.ignoreDirs);
+      const resolvedRoot = await fs.realpath(effectiveRoot);
+      const resolvedSkills = await fs.realpath(layout.skillsRoot);
+      if (resolvedSkills !== resolvedRoot && !resolvedSkills.startsWith(resolvedRoot + path.sep)) throw new Error(`library '${lib.namespace || "(root)"}': skills path escapes the configured root`);
+      if (layout.vaultRoot && lib.vault === undefined) {
+        const resolvedVault = await fs.realpath(layout.vaultRoot);
+        if (resolvedVault !== resolvedRoot && !resolvedVault.startsWith(resolvedRoot + path.sep)) throw new Error(`library '${lib.namespace || "(root)"}': vault path escapes the configured root`);
+      }
       layouts.set(lib.namespace, layout);
       await this.discover(lib, layout.skillsRoot, lib.namespace, 0, dirs);
     }
-    if (this.cfg.libraries.some((l) => l.archive)) {
-      // Drop extractions and downloads that are no longer referenced or have been replaced.
-      // Both are keyed by the archive's sha256, so one keep-set covers them.
-      const keep = new Set([
-        ...[...this.archiveState.values()].map((v) => v.digest),
-        ...[...this.remoteState.values()].map((v) => v.digest),
-      ]);
-      await pruneCache(this.cfg.cacheDir, keep).catch(() => 0);
-      await pruneDownloads(this.cfg.cacheDir, keep).catch(() => 0);
-    }
+    // The cache is shared by server processes. A catalog cannot know what another process uses.
     const oldAll = new Map([...this.skills, ...this.hidden]);
 
     // Limited concurrency: /mnt/d on WSL is slow for many small stats.
@@ -470,7 +471,7 @@ export class Catalog {
     }
 
     const vault = await this.scanVaults(layouts, next, warnings);
-    const changed = this.diff(this.skills, next) || this.diffVault(vault.playbooks, vault.chains);
+    let changed = this.diff(this.skills, next) || this.diff(this.hidden, nextHidden) || this.diffVault(vault.playbooks, vault.chains);
     this.skills = next;
     this.hidden = nextHidden;
     this.playbooks = vault.playbooks;
@@ -480,7 +481,7 @@ export class Catalog {
     let files = 0, bytes = 0;
     const perLib = new Map<string, LibraryStats>(this.cfg.libraries.map((l) => {
       const kind = l.url ? "url" : l.archive ? "archive" : "directory";
-      const digest = l.url ? this.remoteState.get(l.url)?.digest : l.archive ? this.archiveState.get(l.root)?.digest : undefined;
+      const digest = l.url ? this.remoteState.get(`${l.url}#${l.sha256 ?? ""}`)?.digest : l.archive ? this.archiveState.get(l.root)?.digest : undefined;
       const v = vault.perLib.get(l.namespace);
       const st: LibraryStats = {
         namespace: l.namespace, root: l.root, kind, skills: 0, hidden: 0, noScripts: !!(l.noScripts || this.cfg.noScripts),
@@ -510,6 +511,7 @@ export class Catalog {
       playbooks: vault.playbooks.size, valueChains: vault.chains.size, categories, warnings,
       scannedAt: new Date().toISOString(), scanMs: Date.now() - t0,
     };
+    if (JSON.stringify(this.stats.libraries.map(publicLibrary)) !== JSON.stringify(previousLibraries.map(publicLibrary))) changed = true;
     if (changed) for (const fn of this.listeners) fn();
   }
 
@@ -517,11 +519,13 @@ export class Catalog {
     if (playbooks.size !== this.playbooks.size || chains.size !== this.chains.size) return true;
     for (const [k, v] of this.playbooks) {
       const w = playbooks.get(k);
-      if (!w || w.mtimeMs !== v.mtimeMs || w.size !== v.size || w.attachments.length !== v.attachments.length) return true;
+      if (!w || w.mtimeMs !== v.mtimeMs || w.size !== v.size || w.abs !== v.abs ||
+        JSON.stringify(w.attachments.map((a) => [a.rel, a.size, a.mtimeMs])) !== JSON.stringify(v.attachments.map((a) => [a.rel, a.size, a.mtimeMs]))) return true;
     }
     for (const [k, v] of this.chains) {
       const w = chains.get(k);
-      if (!w || w.skillCount !== v.skillCount || w.playbookCount !== v.playbookCount || w.stages.join() !== v.stages.join()) return true;
+      if (!w || JSON.stringify([w.label, w.description, w.stages, w.source, w.skillsByStage, w.playbooksByStage]) !==
+        JSON.stringify([v.label, v.description, v.stages, v.source, v.skillsByStage, v.playbooksByStage])) return true;
     }
     return false;
   }
@@ -558,10 +562,14 @@ export class Catalog {
         if (pr.privateNotes) warnings.push(`${who}: ${pr.privateNotes} note(s) under ${PRIVATE_PLAYBOOK_DIRS.join(", ")} are private playbooks and are not served; only ${PLAYBOOK_DIR} is`);
         const r = await scanPlaybooks({
           library: lib.namespace, vaultRoot, roots: pr.roots,
-          excludeDirs: this.cfg.excludeDirs, maxFileBytes: this.cfg.maxFileBytes, mimeFor,
+          excludeDirs: this.cfg.excludeDirs, maxFileBytes: this.cfg.maxFileBytes, noScripts: !!(this.cfg.noScripts || lib.noScripts), mimeFor,
           showAll: !this.cfg.hideDisabled, skillNames: new Set(libSkills.map((s) => s.name)), prev: this.playbooks,
         });
         for (const w of r.warnings) warnings.push(`${who}: ${w}`);
+        if (this.cfg.lint) for (const p of r.playbooks) {
+          const findings = await lintFiles(p.attachments.map((a) => ({ ...a, rel: a.rel })));
+          for (const f of findings) warnings.push(`${who}: playbook ${p.name} attachment risk flag ${f.rule} @ ${f.file}:${f.line}`);
+        }
         const runner = runnerIn(lib.namespace);
         if (r.playbooks.length + r.hidden.length > 0 && !runner) {
           warnings.push(`${who}: ${r.playbooks.length + r.hidden.length} playbook(s) found but no '${PLAYBOOK_RUNNER}' skill is served; playbooks withheld`);
@@ -601,7 +609,9 @@ export class Catalog {
     if (a.size !== b.size) return true;
     for (const [k, v] of a) {
       const w = b.get(k);
-      if (!w || w.skillMdMtimeMs !== v.skillMdMtimeMs || w.files.length !== v.files.length || w.totalBytes !== v.totalBytes) return true;
+      if (!w || w.skillMdMtimeMs !== v.skillMdMtimeMs || w.abs !== v.abs || w.files.length !== v.files.length ||
+        w.scriptsWithheld !== v.scriptsWithheld || JSON.stringify(w.riskFlags) !== JSON.stringify(v.riskFlags) ||
+        v.files.some((f, i) => f.rel !== w.files[i].rel || f.size !== w.files[i].size || f.mtimeMs !== w.files[i].mtimeMs)) return true;
     }
     return false;
   }
@@ -616,7 +626,7 @@ export class Catalog {
     const st = await fs.stat(lib.root);
     const prev = this.archiveState.get(lib.root);
     if (prev && prev.mtimeMs === st.mtimeMs && prev.size === st.size) {
-      try { await fs.access(prev.dir); return prev.dir; } catch { /* cache was cleared; re-extract */ }
+      try { await verifyExtraction(prev.dir); return prev.dir; } catch { /* cache was cleared or changed; re-extract below */ }
     }
     const r = await extractLibrary(lib.root, this.cfg.cacheDir, this.cfg.archiveLimits);
     this.archiveState.set(lib.root, { mtimeMs: st.mtimeMs, size: st.size, dir: r.dir, digest: r.digest });
@@ -635,9 +645,11 @@ export class Catalog {
    */
   private async resolveRemote(lib: Library, warnings: string[]): Promise<string> {
     const url = lib.url!;
-    const prev = this.remoteState.get(url);
-    if (prev) {
-      try { await fs.access(prev.dir); return prev.dir; } catch { /* extraction was cleared; refetch */ }
+    const key = `${url}#${lib.sha256 ?? ""}`;
+    const prev = this.remoteState.get(key);
+    if (prev && (!lib.sha256 || prev.digest === lib.sha256)) {
+      await verifyExtraction(prev.dir);
+      return prev.dir;
     }
     try {
       const got = await fetchArchive(url, {
@@ -645,14 +657,15 @@ export class Catalog {
         maxBytes: this.cfg.maxDownloadBytes,
         expectedSha256: lib.sha256,
         useSidecar: !lib.sha256,
-        token: this.cfg.fetchToken,
+        token: this.cfg.fetchToken ?? (/^(github\.com|api\.github\.com)$/i.test(new URL(url).hostname) ? process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN : undefined),
         timeoutMs: this.cfg.fetchTimeoutMs,
       });
       const r = await extractLibrary(got.file, this.cfg.cacheDir, this.cfg.archiveLimits);
-      this.remoteState.set(url, { dir: r.dir, digest: r.digest });
+      if (lib.sha256 && r.digest !== lib.sha256) throw new Error(`cached extraction does not match pinned sha256 for ${redact(url)}`);
+      this.remoteState.set(key, { dir: r.dir, digest: r.digest });
       return r.dir;
     } catch (e) {
-      if (prev) {
+      if (prev && (!lib.sha256 || prev.digest === lib.sha256)) {
         warnings.push(`library '${lib.namespace || "(root)"}': ${redact(url)} could not be refreshed (${(e as Error).message}); serving the cached copy`);
         return prev.dir;
       }
@@ -699,16 +712,17 @@ export class Catalog {
       files = kept;
     }
     files.sort((x, y) => (x.rel === "SKILL.md" ? -1 : y.rel === "SKILL.md" ? 1 : x.rel.localeCompare(y.rel)));
+    if (!files.some((f) => f.rel === "SKILL.md")) { warnings.push(`${skillPath}: SKILL.md is not servable; skill not served`); return null; }
     if (files.length > this.cfg.maxFilesPerSkill) {
-      warnings.push(`${skillPath}: ${files.length} files, truncated to ${this.cfg.maxFilesPerSkill} (SEP-2640 limit)`);
-      files.length = this.cfg.maxFilesPerSkill;
+      warnings.push(`${skillPath}: ${files.length} files exceeds ${this.cfg.maxFilesPerSkill}; skill not served because its manifest would be incomplete`);
+      return null;
     }
     const totalBytes = files.reduce((n, f) => n + f.size, 0);
-    if (totalBytes > 16 * 1024 * 1024) warnings.push(`${skillPath}: ${(totalBytes / 1048576).toFixed(1)} MiB exceeds the 16 MiB SEP-2640 per-skill limit; strict hosts may reject it`);
+    if (totalBytes > 16 * 1024 * 1024) { warnings.push(`${skillPath}: ${(totalBytes / 1048576).toFixed(1)} MiB exceeds the 16 MiB SEP-2640 per-skill limit; skill not served`); return null; }
 
     // Reuse parsed SKILL.md, digests and lint results when nothing changed.
     const sameFiles = !!prev && prev.files.length === files.length && files.every((f) => { const pf = prev.files.find((p) => p.rel === f.rel); return pf && pf.mtimeMs === f.mtimeMs && pf.size === f.size; });
-    if (prev && prev.skillMdMtimeMs === st.mtimeMs && prev.scriptsWithheld === scriptsWithheld) {
+    if (prev && prev.abs === abs && prev.skillMdMtimeMs === st.mtimeMs && prev.scriptsWithheld === scriptsWithheld) {
       for (const f of files) {
         const pf = prev.files.find((p) => p.rel === f.rel);
         if (pf && pf.mtimeMs === f.mtimeMs && pf.size === f.size) { f.digest = pf.digest; f.script = pf.script; }
@@ -733,7 +747,8 @@ export class Catalog {
     }
     const description = coerceString(fm.description) || `(no description) ${name}`;
     if (!fm.description) fmWarnings.push("frontmatter.description missing");
-    if (fmWarnings.length) warnings.push(`${skillPath}: ${fmWarnings.join("; ")}`);
+    if (fmWarnings.length) { warnings.push(`${skillPath}: ${fmWarnings.join("; ")}; skill not served`); return null; }
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) { warnings.push(`${skillPath}: invalid Agent Skills name '${name}'; skill not served`); return null; }
 
     return {
       name, dir, library, skillPath, abs,

@@ -37,11 +37,12 @@ test("pack: builds the public subset, served counts match the vault, sidecar wri
   assert.deepEqual(view(fromZip), view(fromDir));
   assert.equal(fromZip.getStats().libraries[0].playbooksHidden, 0);
   assert.doesNotMatch(fromZip.getStats().warnings.join("\n"), /private playbooks/);
-  // deterministic: same input gives byte-identical files (pack.json carries the build timestamp and is excluded)
+  // Identical inputs give byte-identical archives, including pack.json.
   const again = await pack({ ...parsePackArgs(["--vault", vault, "--out", path.join(dir, "bob2.zip")]), log: quiet });
+  assert.equal(again.sha256, r.sha256);
   const dest2 = path.join(dir, "y");
   await extractZip(again.out, dest2, DEFAULT_LIMITS);
-  for (const n of names.filter((x) => x !== "pack.json")) assert.ok((await fs.readFile(path.join(dest, n))).equals(await fs.readFile(path.join(dest2, n))), n);
+  for (const n of names) assert.ok((await fs.readFile(path.join(dest, n))).equals(await fs.readFile(path.join(dest2, n))), n);
 });
 
 test("pack: --all-statuses includes drafts; --wrapper nests; --dry-run writes nothing; bad vault refused", async () => {

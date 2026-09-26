@@ -18,6 +18,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
+import { sha256File } from "./archive.js";
 import { once } from "node:events";
 
 export class RemoteError extends Error {}
@@ -162,6 +163,10 @@ export async function fetchArchive(url: string, opts: FetchOptions): Promise<Fet
     const file = downloadPath(opts.cacheDir, digest);
     try {
       const st = await fsp.stat(file);
+      if (!st.isFile() || st.size > opts.maxBytes || await sha256File(file) !== digest) {
+        await fsp.rm(file, { force: true });
+        return null;
+      }
       return { file, digest, bytes: st.size, cached: true };
     } catch { return null; }
   };

@@ -30,6 +30,7 @@ cd ThirdBrain-skills-mcp
 npm install && npm run build
 node dist/index.js --root /path/to/my-skills --name myskills     # serve one folder over stdio
 node dist/index.js --root /path/to/my-skills --stats             # what would be served, as JSON
+node dist/index.js --root test/fixtures/libA --stats             # try the included public fixture
 ```
 
 Register it with Claude Code (any other MCP host takes the same command line):
@@ -41,6 +42,19 @@ claude mcp add --scope user myskills -- node /path/to/ThirdBrain-skills-mcp/dist
 The agent then has `myskills_search_skills`, `myskills_get_skill`, `myskills_read_skill_file`
 and friends. `npx github:cbruyndoncx/ThirdBrain-skills-mcp --root DIR` builds and runs it without a
 checkout (the package exposes the `skills-mcp` binary).
+
+### Registry metadata
+
+[`server.json`](server.json) describes the stdio package for the
+[official MCP Registry](https://github.com/modelcontextprotocol/registry/blob/main/docs/modelcontextprotocol-io/quickstart.mdx).
+It asks clients for `SKILLS_MCP_ROOT`, the library directory or ZIP to serve. The registry entry
+can be published after version 1.5.1 is available as a public `thirdbrain-skills-mcp` npm package;
+the package's `mcpName` and the registry name must match. This checkout does not itself publish a
+package or registry entry.
+
+The Skills extension working group keeps a separate
+[implementations list](https://github.com/modelcontextprotocol/ext-skills/blob/main/docs/implementations.md).
+Adding this server there is a separate documentation contribution.
 
 ## Ways to use it
 
@@ -181,12 +195,14 @@ there is no category tree in `skill://` URIs.
 | `--no-playbooks` / `SKILLS_PLAYBOOKS=false` | served | Never serve playbooks (default: served when found and a `playbook-runner` skill is served). |
 | `--no-value-chains` / `SKILLS_VALUE_CHAINS=false` | served | Never serve value chains (default: served when found). |
 | `--exclude-tiers T1,T2` / `SKILLS_EXCLUDE_TIERS` / `"excludeTiers"` in the config file | none | Skills and playbooks whose frontmatter `pricing-tier` is in the list (case-insensitive) are not served at all (not even to `skills/get`) and are counted in `hidden` / `playbooksHidden`; `catalog_status` and `--stats` report `tierExcluded {tiers, skills, playbooks}`. The config file value, when set, replaces the flag. |
-| `--http PORT` / `SKILLS_HOST` | stdio; `127.0.0.1`, port `3939` | Streamable HTTP instead of stdio; `SKILLS_HOST` sets the bind address. |
+| `--http PORT` / `SKILLS_HOST` | stdio; `127.0.0.1`, port `3939` | Streamable HTTP instead of stdio; `SKILLS_HOST` sets the bind address. HTTP validates Host and Origin. |
+| `SKILLS_ALLOWED_HOSTS` | empty | Additional comma-separated hostnames accepted by HTTP. Required when `SKILLS_HOST` binds all interfaces. Place remote deployments behind authentication. |
 | `SKILLS_MAX_FILE_BYTES` | 4 MiB | Files above this are not served. |
 | `SKILLS_CACHE_DIR` | `~/.cache/skills-mcp` | Where `.zip` libraries are extracted and downloaded, keyed by content digest. |
 | `SKILLS_MAX_DOWNLOAD_BYTES` | 256 MiB | Ceiling on bytes read from the network for a remote library. |
 | `SKILLS_FETCH_TIMEOUT_MS` | `60000` | Timeout for a single HTTP request when fetching a remote library. |
-| `SKILLS_FETCH_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` | | Bearer token for private archive assets. |
+| `SKILLS_FETCH_TOKEN` | | Explicit bearer token for remote archive assets; sent to the initial library host and same-host redirects. |
+| `GH_TOKEN` / `GITHUB_TOKEN` | | Used automatically only for initial `github.com` or `api.github.com` archive URLs. |
 | `SKILLS_MAX_ARCHIVE_BYTES` | 256 MiB | Total uncompressed size an archive library may extract to. |
 | `SKILLS_MAX_ARCHIVE_ENTRIES` | `8192` | Max entries in an archive library. |
 | `SKILLS_RESCAN_SECONDS` | `60` | Background rescan interval (`0` disables). `<prefix>_catalog_status refresh=true` forces one. |
@@ -201,6 +217,8 @@ Always ignored inside skills, silently: tool and build folders (`.venv`, `venv`,
 (`.pyi`). Also not served, but reported as one `catalog_status` warning per skill
 (`<skill>: N file(s) skipped (… over SKILLS_MAX_FILE_BYTES: …; … symlink: …; … dotfile: …)`, up to
 three names each): files over `SKILLS_MAX_FILE_BYTES`, symlinks, and dotfiles or dot-folders.
+Skills with invalid required frontmatter, an incomplete manifest, or more than 512 files or 16 MiB
+of served content are withheld with a catalog warning.
 
 ## Playbooks and value chains
 
@@ -349,10 +367,13 @@ skills-mcp --lib sales="https://api.github.com/repos/OWNER/REPO/releases/assets/
 failing that a `<url>.sha256` sidecar next to the asset. A mismatch is refused outright rather than
 served. Pinning is stronger than the sidecar, since the sidecar travels the same wire as the zip.
 
-**Caching.** Downloads are keyed by content digest, the same key the extractor uses. A pinned URL
-that has already been fetched never touches the network again — the second start of the server
-above scans in ~80 ms. A remote library is fetched once per process; change the URL or the pin to
-pick up a new version.
+**Caching.** Downloads are keyed by content digest, the same key the extractor uses. Cached
+downloads are hashed again before reuse, and extracted files are checked against a local integrity
+record before each scan. A changed extraction is refused until that cache entry is removed. A pinned
+URL with a valid cached download does not need a network request. A remote library is fetched once
+per process; change the URL or the pin to pick up a new version. The shared cache is not pruned by a
+running server, because another server may be using those files. Operators can remove unused files
+when no server is running.
 
 **Failure handling.** If a refresh fails but a previous extraction is still cached, the cached copy
 keeps being served and a warning is recorded — a transient DNS blip during a background rescan will
@@ -414,8 +435,10 @@ skills-mcp pull --with-deps --keep-path --sync --to ~/.cache/skills-mcp-client/a
   --command node dist/index.js --lib acme=/path/to/acme-skills
 ```
 
-`pull` walks `skills/list`, reads every file with `resources/read`, verifies each sha256 digest
-against the manifest, refuses paths outside the skill, and writes atomically. It negotiates the
+`pull` walks `skills/list`, reads every file with `resources/read`, verifies its byte count and
+sha256 digest against the manifest, refuses unsafe paths and symlinked destinations, and writes
+each file through a temporary file. Skills with dynamic manifests cannot be synced with content
+verification and are rejected. Colliding destination names require `--keep-path`. It negotiates the
 protocol era (probing with `server/discover`, falling back to the 2025 handshake), so it works
 against servers on either revision, including ones that expose skills only on `2026-07-28`;
 `--legacy-protocol` skips the probe. It accepts both the final `{skill}` and the draft bare-entry
@@ -459,7 +482,8 @@ and `valueChains` are global switches (default `true`); `excludeTiers` (an array
 default none) is the `--exclude-tiers` list.
 
 Libraries from the file can be added, removed or re-pointed while the server runs; libraries given
-on the command line stay fixed. Relative roots resolve against the file's directory. A broken edit is
+on the command line stay fixed. Relative roots resolve against the file's directory. CLI and
+environment restrictions such as `--no-scripts` remain active across reloads. A broken edit is
 logged and the previous set is kept. Changes trigger `resources`, `tools` and `prompts`
 `list_changed` notifications. `kill -HUP <pid>` forces an immediate reload.
 
@@ -477,7 +501,7 @@ The server never executes anything. Three additional layers label or withhold ri
 | Layer | What it does | Where it shows up |
 |---|---|---|
 | Provenance | Lifts `origin`, `origin-repo`, `risk`, `outbound`, `outbound_targets`, `gate_required`, `dev-status`, `pricing-tier`, `license`, `allowed-tools` from frontmatter | `_meta["io.modelcontextprotocol.skills/<field>"]` on resources, `trust` in search/list/get_skill output, `Provenance:` line in get_skill text |
-| `--no-scripts` (global) / `"noScripts": true` (per library) | Drops executable files (`.sh .bash .zsh .ps1 .psm1 .bat .cmd .py .js .mjs .cjs .ts .rb .pl .php`) from manifests, `resources/read` and `read_skill_file` | `scriptsWithheld` count, `_meta[".../scripts-withheld"]`, catalog status |
+| `--no-scripts` (global) / `"noScripts": true` (per library) | Drops executable files (`.sh .bash .zsh .ps1 .psm1 .bat .cmd .py .js .mjs .cjs .ts .rb .pl .php`) from skill manifests and playbook attachments | `scriptsWithheld` count for skills, `_meta[".../scripts-withheld"]`, catalog status |
 | Scan-time linter (`--no-lint` to disable) | Regex rules over text files ≤ 512 KiB: `pipe-to-shell`, `remote-exec`, `eval-decode`, `base64-blob`, `destructive-rm`, `world-writable`, `sensitive-path`, `credential-literal`, `env-exfil`, `prompt-injection`, `reverse-shell` | Catalog warnings, `_meta[".../risk-flags"]`, `riskFlags` in search/list results, per-finding `file:line` in get_skill plus a `⚠ Risk flags` banner in its text |
 
 The linter labels, it does not block. Typical hits are `curl … | sh` install instructions for
@@ -609,8 +633,8 @@ commit `7169291`, 2026-09-11), SEP-2640 server scenarios, by `npm run test:confo
   provided they follow RFC 3986; path segments are percent-encoded and templates follow RFC 6570.
   They are separate from the SEP-2640 `skill://` scheme, and `skills/list` returns skills only.
 * Digests are computed lazily and cached per file `mtime`, so `skills/list` is cheap after the first call.
-* SEP-2640 limits (512 files, 16 MiB per skill) are enforced/flagged: file lists are truncated
-  at 512 and oversized skills are listed in `<prefix>_catalog_status include_warnings=true`.
+* Skills with more than 512 files or 16 MiB of served content are withheld and listed in
+  `<prefix>_catalog_status include_warnings=true`; manifests are never truncated.
 * `skills/get` answers for hidden (disabled) skills too, as the spec requires, and wraps the entry
   as `{skill}`.
 * Cache fields (`ttlMs`, `cacheScope`) are emitted on `2026-07-28` only: by us on `skills/list`,
@@ -622,7 +646,7 @@ commit `7169291`, 2026-09-11), SEP-2640 server scenarios, by `npm run test:confo
 ## Development
 
 ```bash
-npm run test:unit   # 96 unit tests (in-memory MCP client, fixtures under test/fixtures)
+npm run test:unit   # in-memory MCP client, fixtures under test/fixtures
 npm run test:nested # nested-path fixture (skill://acme/billing/refunds/...)
 npm run test:eras   # stdio with a 2025 client, a pinned 2026-07-28 client and auto negotiation
 npm run test:conformance # official SEP-2640 conformance scenarios over HTTP, both revisions

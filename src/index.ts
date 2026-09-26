@@ -2,6 +2,7 @@
 import http from "node:http";
 import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createMcpHandler } from "@modelcontextprotocol/server";
+import { validateHostHeader, validateOriginHeader } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { loadConfig, reloadConfigFile } from "./config.js";
 import { Catalog } from "./catalog.js";
@@ -56,10 +57,16 @@ async function main() {
   // per-request envelope) from one factory; the era decides only whether cache fields are emitted.
   if (cfg.http) {
     const { port, host } = cfg.http;
+    const extraHosts = (process.env.SKILLS_ALLOWED_HOSTS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+    if ((host === "0.0.0.0" || host === "::") && !extraHosts.length) throw new Error("SKILLS_ALLOWED_HOSTS is required when HTTP binds to all interfaces");
+    const allowedHosts = [...new Set([...(host === "0.0.0.0" || host === "::" ? [] : [host]), ...(host === "127.0.0.1" ? ["localhost"] : []), ...(host === "localhost" ? ["127.0.0.1"] : []), ...extraHosts])];
     // Stateless: one server instance per request; the catalog is shared.
     const mcp = toNodeHandler(createMcpHandler(({ era }) => createServer(cfg, cat, era)));
     const srv = http.createServer((req, res) => {
       if (req.url?.split("?")[0] !== "/mcp") { res.writeHead(404).end(); return; }
+      const hostOk = validateHostHeader(req.headers.host, allowedHosts);
+      const originOk = validateOriginHeader(req.headers.origin, allowedHosts);
+      if (!hostOk.ok || !originOk.ok) { res.writeHead(403).end(); return; }
       Promise.resolve(mcp(req, res)).catch((e) => {
         log("request failed:", (e as Error)?.message ?? e);
         if (!res.headersSent) res.writeHead(500).end();

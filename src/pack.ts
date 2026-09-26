@@ -7,7 +7,7 @@
  *   00-CORE/Agents/skills/                     every skill the server would serve (same ignore rules)
  *   00-CORE/Playbooks/                         playbooks at `status: active` and the files they embed
  *   20-COMPANY/03-PROCESSES/value-chains.md    the canonical chain definitions (or VALUE-CHAINS.md)
- *   pack.json                                  what was packed, by whom, when
+ *   pack.json                                  what was packed and by which generator
  *
  * Company, personal and client folders are never read. `_archive/` and `UPGRADE/` are skipped.
  * The zip is deterministic for the same input (sorted entries, fixed timestamps) and gets a
@@ -17,6 +17,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import zlib from "node:zlib";
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
 import { PKG_VERSION } from "./version.js";
 import { splitFrontmatter, coerceString } from "./frontmatter.js";
 import { isArchivePath } from "./archive.js";
@@ -86,8 +87,17 @@ export function parsePackArgs(argv: string[]): PackOptions {
   return o;
 }
 
-async function isDir(p: string): Promise<boolean> { try { return (await fs.stat(p)).isDirectory(); } catch { return false; } }
-async function isFile(p: string): Promise<boolean> { try { return (await fs.stat(p)).isFile(); } catch { return false; } }
+async function isDir(p: string): Promise<boolean> { try { return (await fs.lstat(p)).isDirectory(); } catch { return false; } }
+async function isFile(p: string): Promise<boolean> { try { return (await fs.lstat(p)).isFile(); } catch { return false; } }
+async function within(root: string, candidate: string): Promise<boolean> {
+  try { return (await fs.realpath(candidate)).startsWith((await fs.realpath(root)) + path.sep); } catch { return false; }
+}
+async function isRegularFile(p: string): Promise<boolean> { try { return (await fs.lstat(p)).isFile(); } catch { return false; } }
+async function readRegularFile(p: string): Promise<Buffer> {
+  const handle = await fs.open(p, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try { if (!(await handle.stat()).isFile()) throw new Error(`${p} is not a regular file`); return await handle.readFile(); }
+  finally { await handle.close(); }
+}
 const rel = (root: string, abs: string) => path.relative(root, abs).split(path.sep).join("/");
 
 /** Every file of one skill directory that the server would serve; null when the skill bundles an archive. */
@@ -111,7 +121,19 @@ async function skillFiles(dir: string, o: PackOptions, warnings: string[], skill
     }
     return true;
   };
-  return (await walk(dir)) ? out : null;
+  if (!(await walk(dir))) return null;
+  const instruction = path.join(dir, "SKILL.md");
+  if (!out.includes(instruction)) { warnings.push(`${skillRel}: SKILL.md cannot be served; skill left out`); return null; }
+  const { data } = splitFrontmatter(await fs.readFile(instruction, "utf8"));
+  if (!data || data.name !== path.basename(dir) || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(String(data.name)) || typeof data.description !== "string" || !data.description.trim()) {
+    warnings.push(`${skillRel}: invalid required frontmatter; skill left out`);
+    return null;
+  }
+  if (out.length > 512 || (await Promise.all(out.map(async (f) => (await fs.stat(f)).size))).reduce((a, b) => a + b, 0) > 16 * 1024 * 1024) {
+    warnings.push(`${skillRel}: exceeds the skill file or byte limit; skill left out`);
+    return null;
+  }
+  return out;
 }
 
 /** Skill directories (folders holding SKILL.md) below the skills root, up to 4 levels, never descending into a skill. */
@@ -145,9 +167,9 @@ async function findPlaybooks(root: string, o: PackOptions, warnings: string[]): 
       notes.push(abs);
       for (const m of body.matchAll(EMBED_RE)) {
         const name = m[1].trim();
-        if (name.includes("/") || name.includes("\\") || name.includes("..")) continue;
+        if (name.includes("/") || name.includes("\\") || name.includes("..") || name.startsWith(".") || isArchivePath(name)) continue;
         const a = path.join(d, name);
-        if (await isFile(a)) {
+        if (await isRegularFile(a)) {
           if ((await fs.stat(a)).size > o.maxFileBytes) warnings.push(`playbook ${e.name}: embedded ${name} is over the per-file limit, left out`);
           else attachments.add(a);
         } else warnings.push(`playbook ${e.name}: embedded file ${name} not found next to it`);
@@ -197,7 +219,7 @@ export async function pack(o: PackOptions): Promise<PackResult> {
   const vault = path.resolve(o.vault);
   const warnings: string[] = [];
   const skillsRoot = path.join(vault, SKILLS_DIR);
-  if (!(await isDir(skillsRoot))) throw new Error(`${vault} is not a vault: no ${SKILLS_DIR} inside`);
+  if (!(await isDir(skillsRoot)) || !(await within(vault, skillsRoot))) throw new Error(`${vault} is not a vault: no safe ${SKILLS_DIR} inside`);
   const entries: Entry[] = [];
   const prefix = o.wrapper ? o.wrapper + "/" : "";
 
@@ -214,7 +236,7 @@ export async function pack(o: PackOptions): Promise<PackResult> {
   // Playbooks
   const pbRoot = path.join(vault, PLAYBOOK_DIR);
   let playbookCount = 0;
-  if (await isDir(pbRoot)) {
+  if (await isDir(pbRoot) && await within(vault, pbRoot)) {
     const r = await findPlaybooks(pbRoot, o, warnings);
     playbookCount = r.notes.length;
     for (const f of [...r.notes, ...r.attachments].sort()) entries.push({ name: prefix + rel(vault, f), abs: f });
@@ -225,13 +247,15 @@ export async function pack(o: PackOptions): Promise<PackResult> {
   let chainFile: string | undefined;
   for (const relPath of VALUE_CHAIN_FILES) {
     const abs = path.join(vault, relPath);
-    if (await isFile(abs)) { chainFile = relPath; entries.push({ name: prefix + relPath, abs }); break; }
+    if (await isFile(abs) && await within(vault, abs)) { chainFile = relPath; entries.push({ name: prefix + relPath, abs }); break; }
   }
   if (!chainFile) warnings.push("no value-chains file found: value chains will be derived from frontmatter only");
   else if (chainFile !== VALUE_CHAIN_FILES[0]) warnings.push(`packed ${chainFile}: the generated index may name playbooks that are not in the pack`);
 
   const manifest = {
-    generator: `skills-mcp ${PKG_VERSION} pack`, created: new Date().toISOString(), vault: path.basename(vault),
+    generator: `skills-mcp ${PKG_VERSION} pack`,
+    ...(process.env.SOURCE_DATE_EPOCH ? { created: new Date(Number(process.env.SOURCE_DATE_EPOCH) * 1000).toISOString() } : {}),
+    vault: path.basename(vault),
     skills: skillCount, playbooks: playbookCount, valueChains: chainFile ?? null,
     contents: [SKILLS_DIR.split(path.sep).join("/"), PLAYBOOK_DIR, ...(chainFile ? [chainFile] : [])],
   };
@@ -246,7 +270,7 @@ export async function pack(o: PackOptions): Promise<PackResult> {
   }
   const loaded: { name: string; data: Buffer }[] = [];
   let bytes = 0;
-  for (const e of entries) { const data = e.data ?? await fs.readFile(e.abs!); bytes += data.length; loaded.push({ name: e.name, data }); }
+  for (const e of entries) { const data = e.data ?? await readRegularFile(e.abs!); bytes += data.length; loaded.push({ name: e.name, data }); }
   const zip = buildZip(loaded);
   const sha256 = createHash("sha256").update(zip).digest("hex");
   await fs.mkdir(path.dirname(out), { recursive: true });

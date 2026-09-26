@@ -5,7 +5,8 @@
 import fs from "node:fs/promises";
 import { PKG_VERSION } from "./version.js";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { constants } from "node:fs";
 import { z } from "zod";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
@@ -37,7 +38,7 @@ export interface PullOptions {
 const SkillEntry = z.object({
   uri: z.string(),
   frontmatter: z.record(z.string(), z.unknown()),
-  resources: z.union([z.literal("dynamic"), z.array(z.object({ uri: z.string(), digest: z.string(), size: z.number().int().nonnegative() }))]),
+  resources: z.union([z.literal("dynamic"), z.array(z.object({ uri: z.string(), digest: z.string().regex(/^sha256:[0-9a-f]{64}$/), size: z.number().int().nonnegative() }))]),
   _meta: z.record(z.string(), z.unknown()).optional(),
 });
 const SkillsListResult = z.object({ skills: z.array(SkillEntry), nextCursor: z.string().optional() }).passthrough();
@@ -60,7 +61,29 @@ export function requiredDepsOf(e: { _meta?: Record<string, unknown> }): string[]
 }
 
 export function skillPathOf(uri: string): string {
-  return uri.replace(/^skill:\/\//, "").replace(/\/SKILL\.md$/, "").split("/").map(decodeURIComponent).join("/");
+  const u = new URL(uri);
+  const prefix = u.protocol === "skill:" ? "" : `${u.protocol.slice(0, -1)}/`;
+  return prefix + [u.host, ...u.pathname.replace(/^\//, "").replace(/\/SKILL\.md$/, "").split("/")].filter(Boolean).map(decodeURIComponent).join("/");
+}
+
+/** Refuse symlink components before every filesystem operation, including existing destinations. */
+async function ensureSafePath(p: string): Promise<void> {
+  const abs = path.resolve(p);
+  const parts = abs.slice(path.parse(abs).root.length).split(path.sep).filter(Boolean);
+  let at = path.parse(abs).root;
+  for (const part of parts) {
+    at = path.join(at, part);
+    const st = await fs.lstat(at).catch((e: NodeJS.ErrnoException) => {
+      if (e.code === "ENOENT") return null;
+      throw e;
+    });
+    if (st?.isSymbolicLink()) throw new Error(`refusing symlink in pull destination: ${at}`);
+  }
+}
+
+function safeRelative(rel: string): boolean {
+  return !!rel && !rel.includes("\\") && !rel.includes("\0") && !rel.startsWith("/") &&
+    !/^[a-zA-Z]:/.test(rel) && rel.split("/").every((s) => !!s && s !== "." && s !== "..");
 }
 
 export async function listAllSkills(client: Client): Promise<SkillEntryT[]> {
@@ -110,6 +133,18 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
     if (!selected.length) throw new Error("nothing selected: give skill names, or --all");
     if (o.withDeps && !o.all) selected = await withDependencies(client, entries, selected, o.log);
 
+    const destinationNames = new Map<string, string>();
+    for (const e of selected) {
+      const sp = skillPathOf(e.uri);
+      const name = String(e.frontmatter.name ?? sp.split("/").pop());
+      const rel = o.keepPath ? sp : name;
+      if (!safeRelative(rel)) throw new Error(`unsafe skill destination '${rel}'`);
+      const dest = path.resolve(o.to, rel);
+      const previous = destinationNames.get(dest);
+      if (previous && previous !== e.uri) throw new Error(`skills '${previous}' and '${e.uri}' share destination ${dest}; use --keep-path`);
+      destinationNames.set(dest, e.uri);
+    }
+
     let written = 0, skipped = 0;
     const done: string[] = [];
     for (const e of selected) {
@@ -117,11 +152,13 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
       const name = String(e.frontmatter.name ?? sp.split("/").pop());
       const dest = path.resolve(o.to, o.keepPath ? sp : name);
       if (!dest.startsWith(path.resolve(o.to) + path.sep)) throw new Error(`refusing to write outside ${o.to}: ${dest}`);
+      await ensureSafePath(dest);
       let resources = e.resources;
       if (resources === "dynamic") {
-        // Not enumerable up front: re-ask skills/get (servers MUST answer) and fall back to SKILL.md only.
+        // Re-ask once: a dynamic manifest cannot support a verified disk sync.
         const g = await getSkill(client, e.uri);
-        resources = g.resources === "dynamic" ? [{ uri: e.uri, digest: "", size: 0 }] : g.resources;
+        if (g.resources === "dynamic") throw new Error(`${sp}: dynamic resources have no digests and cannot be pulled with integrity verification`);
+        resources = g.resources;
       }
       const exists = await fs.stat(dest).then(() => true, () => false);
       if (exists && !o.force && !o.sync) { o.log(`skip  ${sp} (exists at ${dest}; use --force or --sync)`); skipped++; continue; }
@@ -130,15 +167,17 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
       for (const r of resources) {
         if (!r.uri.startsWith(prefix)) throw new Error(`${sp}: resource ${r.uri} is outside the skill`);
         const rel = r.uri.slice(prefix.length).split("/").map(decodeURIComponent).join("/");
-        if (rel.split("/").some((seg) => seg === ".." || seg === "" )) throw new Error(`${sp}: unsafe path ${rel}`);
+        if (!safeRelative(rel)) throw new Error(`${sp}: unsafe path ${rel}`);
+        if (wanted.has(rel)) throw new Error(`${sp}: duplicate resource ${rel}`);
         wanted.set(rel, r);
       }
+      if (!wanted.has("SKILL.md") || wanted.get("SKILL.md")!.uri !== e.uri) throw new Error(`${sp}: manifest is missing its SKILL.md resource`);
       // --sync: a local file whose bytes already hash to the manifest digest is kept without a network read.
       const current = new Set<string>();
       if (o.sync && exists) {
         for (const rel of await listFiles(dest)) {
           const r = wanted.get(rel);
-          if (r?.digest && (await sha256File(path.join(dest, ...rel.split("/")))) === r.digest) current.add(rel);
+          if (r && (await fs.stat(path.join(dest, ...rel.split("/")))).size === r.size && (await sha256File(path.join(dest, ...rel.split("/")))) === r.digest) current.add(rel);
         }
       }
       const todo = [...wanted].filter(([rel]) => !current.has(rel));
@@ -149,22 +188,30 @@ export async function pull(o: PullOptions): Promise<{ written: number; skipped: 
         const res = await client.readResource({ uri: r.uri });
         const c = res.contents[0];
         if (!c) throw new Error(`${sp}: empty read for ${r.uri}`);
+        if (c.uri !== r.uri) throw new Error(`${sp}: server returned ${c.uri} for ${r.uri}`);
         const buf = "blob" in c && typeof c.blob === "string" ? Buffer.from(c.blob, "base64") : Buffer.from(String((c as any).text ?? ""), "utf8");
-        if (r.digest) {
-          const actual = "sha256:" + createHash("sha256").update(buf).digest("hex");
-          if (actual !== r.digest) throw new Error(`${sp}: digest mismatch for ${rel}\n  expected ${r.digest}\n  actual   ${actual}`);
-        }
+        if (buf.length !== r.size) throw new Error(`${sp}: size mismatch for ${rel}: expected ${r.size}, got ${buf.length}`);
+        const actual = "sha256:" + createHash("sha256").update(buf).digest("hex");
+        if (actual !== r.digest) throw new Error(`${sp}: digest mismatch for ${rel}\n  expected ${r.digest}\n  actual   ${actual}`);
         if (o.dryRun) continue;
         const target = path.join(dest, ...rel.split("/"));
+        await ensureSafePath(target);
         await fs.mkdir(path.dirname(target), { recursive: true });
-        const tmp = target + ".tmp-" + process.pid;
-        await fs.writeFile(tmp, buf);
-        await fs.rename(tmp, target);
+        await ensureSafePath(target);
+        const tmp = target + ".tmp-" + randomBytes(8).toString("hex");
+        const handle = await fs.open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+        try {
+          try { await handle.writeFile(buf); } finally { await handle.close(); }
+          await fs.rename(tmp, target);
+        } catch (error) {
+          await fs.rm(tmp, { force: true }).catch(() => {});
+          throw error;
+        }
         written++;
       }
       for (const rel of stale) {
         o.log(`${o.dryRun ? "would rm" : "rm   "} ${sp}/${rel} (no longer in the skill)`);
-        if (!o.dryRun) await fs.rm(path.join(dest, ...rel.split("/")));
+        if (!o.dryRun) { const target = path.join(dest, ...rel.split("/")); await ensureSafePath(target); await fs.rm(target); }
       }
       if (stale.length && !o.dryRun) await pruneEmptyDirs(dest);
       done.push(sp);
