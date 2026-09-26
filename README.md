@@ -195,6 +195,7 @@ there is no category tree in `skill://` URIs.
 | `--no-playbooks` / `SKILLS_PLAYBOOKS=false` | served | Never serve playbooks (default: served when found and a `playbook-runner` skill is served). |
 | `--no-value-chains` / `SKILLS_VALUE_CHAINS=false` | served | Never serve value chains (default: served when found). |
 | `--exclude-tiers T1,T2` / `SKILLS_EXCLUDE_TIERS` / `"excludeTiers"` in the config file | none | Skills and playbooks whose frontmatter `pricing-tier` is in the list (case-insensitive) are not served at all (not even to `skills/get`) and are counted in `hidden` / `playbooksHidden`; `catalog_status` and `--stats` report `tierExcluded {tiers, skills, playbooks}`. The config file value, when set, replaces the flag. |
+| `--dev-status S1,S2` / `SKILLS_DEV_STATUS` / `"devStatus"` in the config file | all | Serve only skills whose frontmatter `dev-status` is in the list (case-insensitive), e.g. `integrated`. A skill whose `dev-status` is set to anything else is not served at all (not even to `skills/get`) and is counted in `hidden`. A skill **without** a `dev-status` field is served (the library does not track it) and counted as `untracked`. `catalog_status` and `--stats` report `devStatusExcluded {statuses, skills, untracked}`. A skill withheld by both filters is counted under `tierExcluded` only. Playbooks are not affected. The config file value, when set, replaces the flag. |
 | `--http PORT` / `SKILLS_HOST` | stdio; `127.0.0.1`, port `3939` | Streamable HTTP instead of stdio; `SKILLS_HOST` sets the bind address. HTTP validates Host and Origin. |
 | `SKILLS_ALLOWED_HOSTS` | empty | Additional comma-separated hostnames accepted by HTTP. Required when `SKILLS_HOST` binds all interfaces. Place remote deployments behind authentication. |
 | `SKILLS_MAX_FILE_BYTES` | 4 MiB | Files above this are not served. |
@@ -473,13 +474,15 @@ skills-mcp --config skills.json          # re-read on every rescan (default 60 s
       "metadata": { "channel": "stable" } },
     { "namespace": "vendor", "url": "https://host/vendor-2.7.0.zip", "sha256": "fac65d24...", "noScripts": true, "vault": false },
     { "namespace": "team", "root": "../team/skills", "vault": "../team" } ],
-  "noScripts": false, "lint": true, "playbooks": true, "valueChains": true, "excludeTiers": [] }
+  "noScripts": false, "lint": true, "playbooks": true, "valueChains": true, "excludeTiers": [],
+  "devStatus": [] }
 ```
 
 `vault` is optional: a path (relative to the file) naming a vault directory explicitly when the
 library root is only the skills folder, or `false` to serve that library's skills only. `playbooks`
 and `valueChains` are global switches (default `true`); `excludeTiers` (an array or a comma string,
-default none) is the `--exclude-tiers` list.
+default none) is the `--exclude-tiers` list, and `devStatus` (same forms, default none) the
+`--dev-status` list.
 
 Libraries from the file can be added, removed or re-pointed while the server runs; libraries given
 on the command line stay fixed. Relative roots resolve against the file's directory. CLI and
@@ -703,13 +706,18 @@ conventions in the sections above come from BOB. The vault's own `vault-release`
 published packs; `skills-mcp pack` builds the MCP-served subset of one.
 
 **Serving the live vault.** Point at the vault root, not the skills folder, to get playbooks and
-value chains:
+value chains. To serve only what is ready and integrated, and nothing private, withhold the
+`internal` and `private` pricing tiers and every skill whose `dev-status` is not `integrated`:
 
 ```bash
 claude mcp add --scope user skills -- node /path/to/ThirdBrain-skills-mcp/dist/index.js \
   --lib bob=/path/to/brncx-skills \
-  --lib gbl=/path/to/gbl-skills
+  --lib gbl=/path/to/gbl-skills \
+  --exclude-tiers internal,private --dev-status integrated
 ```
+
+Both filters apply to every library. A library whose skills carry no `dev-status` field is served
+in full and shows up as `untracked` in `devStatusExcluded`.
 
 This repository's `.mcp.json` does the same for one library: `node ${PWD}/dist/index.js --lib
 bob=${BOB_VAULT}`, so it works when the MCP client is started in the repository folder after
@@ -746,6 +754,7 @@ server gave the server a second, un-namespaced library: next to `--lib` it refus
 | Value chains, from the canonical file | 14: 12 staged chains and the 2 buckets `operating-controls` and `infrastructure` |
 | Skills declaring at least one required runtime dependency | 142 |
 | `--exclude-tiers internal,private` | withholds 13 skills and 3 playbooks |
+| `--dev-status integrated` (2026-09-26) | withholds 1 skill (`beancount`, `dev-status: dev`); 0 untracked. With `--exclude-tiers internal,private` too it serves 377 skills (21 hidden: 8 disabled, 13 tier) and 83 playbooks; `beancount` is also `private`, so `devStatusExcluded.skills` is 0 |
 | Linter | 15 served skills flagged: 11 `curl … \| sh` install instructions, 2 that document prompt-injection phrasing, 1 test fixture with a sensitive path, 1 `env-exfil` match; a 16th, hidden skill for test fixtures |
 | SEP-2640 limits | none exceeded: largest skill `nl-accounts-review` at 3.8 MiB, most files 166 |
 | Files skipped (over size, symlink, dotfile) | none |

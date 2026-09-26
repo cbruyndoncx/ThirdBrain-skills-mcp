@@ -167,6 +167,13 @@ export interface CatalogStats {
   archiveSkillsRejected: number;
   /** Skills and playbooks not served because their pricing-tier is in --exclude-tiers (also counted in hidden / playbooksHidden). Present only when tiers are excluded. */
   tierExcluded?: { tiers: string[]; skills: number; playbooks: number };
+  /**
+   * Present only when --dev-status is set. `skills`: skills not served because their `dev-status` is
+   * set and not in the list (also counted in hidden). `untracked`: skills that carry no `dev-status`
+   * and are therefore served (or hidden only for another reason). A skill withheld by
+   * --exclude-tiers is counted there, not here.
+   */
+  devStatusExcluded?: { statuses: string[]; skills: number; untracked: number };
   skills: number;
   hidden: number;
   files: number;
@@ -226,11 +233,24 @@ export class Catalog {
   private archiveRejected = 0;
   /** Per scan: skills (by library) and playbooks withheld by --exclude-tiers. */
   private tierHidden = { skills: new Map<string, number>(), playbooks: 0 };
+  /** Per scan: skills (by library) withheld by --dev-status, and skills with no dev-status (untracked). */
+  private devHidden = { skills: new Map<string, number>(), untracked: 0 };
 
   /** True when a note's pricing-tier is excluded by configuration. */
   private tierExcluded(fm: Record<string, unknown>): boolean {
     if (!this.cfg.excludeTiers?.size) return false;
     return coerceList(fm["pricing-tier"]).some((t) => this.cfg.excludeTiers.has(t.toLowerCase()));
+  }
+
+  /**
+   * How a skill fares under --dev-status: "off" when no filter is set, "untracked" when it carries
+   * no dev-status (served), "served" when its dev-status is listed, "withheld" otherwise.
+   */
+  private devStatusOf(fm: Record<string, unknown>): "off" | "untracked" | "served" | "withheld" {
+    if (!this.cfg.devStatus?.size) return "off";
+    const values = coerceList(fm["dev-status"]).map((v) => v.trim().toLowerCase()).filter(Boolean);
+    if (!values.length) return "untracked";
+    return values.some((v) => this.cfg.devStatus.has(v)) ? "served" : "withheld";
   }
 
   constructor(private cfg: Config) {}
@@ -409,6 +429,10 @@ export class Catalog {
     const warnings: string[] = [];
     this.archiveRejected = 0;
     this.tierHidden = { skills: new Map(), playbooks: 0 };
+    this.devHidden = { skills: new Map(), untracked: 0 };
+    /** Skills withheld by a filter, per library by name, with the reason; named in dependency warnings. */
+    const withheld = new Map<string, Map<string, string>>();
+    const withhold = (s: Skill, reason: string) => (withheld.get(s.library) ?? withheld.set(s.library, new Map()).get(s.library)!).set(s.name, reason);
     const next = new Map<string, Skill>();
     const nextHidden = new Map<string, Skill>();
     const dirs: Discovered[] = [];
@@ -456,7 +480,19 @@ export class Catalog {
           const s = await this.loadSkill(d, oldAll.get(d.skillPath), warnings);
           if (!s) continue;
           // Excluded tiers are withheld entirely (not even skills/get answers), and counted as hidden.
-          if (this.tierExcluded(s.frontmatter)) { this.tierHidden.skills.set(s.library, (this.tierHidden.skills.get(s.library) ?? 0) + 1); continue; }
+          if (this.tierExcluded(s.frontmatter)) {
+            this.tierHidden.skills.set(s.library, (this.tierHidden.skills.get(s.library) ?? 0) + 1);
+            withhold(s, `pricing-tier ${coerceList(s.frontmatter["pricing-tier"]).join(",")}`);
+            continue;
+          }
+          // Same for a dev-status outside --dev-status; a skill without the field is served (untracked).
+          const dev = this.devStatusOf(s.frontmatter);
+          if (dev === "withheld") {
+            this.devHidden.skills.set(s.library, (this.devHidden.skills.get(s.library) ?? 0) + 1);
+            withhold(s, `dev-status ${coerceList(s.frontmatter["dev-status"]).join(",")}`);
+            continue;
+          }
+          if (dev === "untracked") this.devHidden.untracked++;
           if (next.has(s.skillPath) || nextHidden.has(s.skillPath)) { warnings.push(`${s.skillPath}: duplicate skill path`); continue; }
           (s.disabled && this.cfg.hideDisabled ? nextHidden : next).set(s.skillPath, s);
         } catch (e) {
@@ -467,7 +503,9 @@ export class Catalog {
     await Promise.all(Array.from({ length: CONC }, worker));
     for (const s of [...next.values(), ...nextHidden.values()]) {
       const missing = s.dependencies.required.filter((d) => !this.inLibrary(s.library, d, [next, nextHidden]));
-      if (missing.length) warnings.push(`${s.skillPath}: runtime dependenc${missing.length > 1 ? "ies" : "y"} ${missing.map((d) => `'${d}'`).join(", ")} not served in library '${s.library || "(root)"}'; pull --with-deps cannot complete its closure`);
+      // A dependency withheld by --exclude-tiers / --dev-status is named with the reason, so the operator sees why.
+      const why = (d: string) => { const r = withheld.get(s.library)?.get(d); return r ? `'${d}' (withheld: ${r})` : `'${d}'`; };
+      if (missing.length) warnings.push(`${s.skillPath}: runtime dependenc${missing.length > 1 ? "ies" : "y"} ${missing.map(why).join(", ")} not served in library '${s.library || "(root)"}'; pull --with-deps cannot complete its closure`);
     }
 
     const vault = await this.scanVaults(layouts, next, warnings);
@@ -505,9 +543,12 @@ export class Catalog {
     for (const s of nextHidden.values()) perLib.get(s.library)!.hidden++;
     let tierSkills = 0;
     for (const [ns, n] of this.tierHidden.skills) { perLib.get(ns)!.hidden += n; tierSkills += n; }
+    let devSkills = 0;
+    for (const [ns, n] of this.devHidden.skills) { perLib.get(ns)!.hidden += n; devSkills += n; }
     this.stats = {
-      root: this.cfg.root, libraries: [...perLib.values()], flaggedSkills, scriptsWithheld, archiveSkillsRejected: this.archiveRejected, skills: next.size, hidden: nextHidden.size + tierSkills, files, bytes,
+      root: this.cfg.root, libraries: [...perLib.values()], flaggedSkills, scriptsWithheld, archiveSkillsRejected: this.archiveRejected, skills: next.size, hidden: nextHidden.size + tierSkills + devSkills, files, bytes,
       ...(this.cfg.excludeTiers?.size ? { tierExcluded: { tiers: [...this.cfg.excludeTiers], skills: tierSkills, playbooks: this.tierHidden.playbooks } } : {}),
+      ...(this.cfg.devStatus?.size ? { devStatusExcluded: { statuses: [...this.cfg.devStatus], skills: devSkills, untracked: this.devHidden.untracked } } : {}),
       playbooks: vault.playbooks.size, valueChains: vault.chains.size, categories, warnings,
       scannedAt: new Date().toISOString(), scanMs: Date.now() - t0,
     };

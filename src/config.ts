@@ -55,6 +55,8 @@ export interface ConfigFile {
   valueChains?: boolean;
   /** Hide skills and playbooks whose `pricing-tier` is one of these (e.g. ["internal", "private"]). */
   excludeTiers?: string[] | string;
+  /** Serve only skills whose `dev-status` is one of these (e.g. ["integrated"]); skills without the field are served. */
+  devStatus?: string[] | string;
 }
 
 export interface Config {
@@ -76,6 +78,12 @@ export interface Config {
   valueChains: boolean;
   /** Lowercased `pricing-tier` values whose skills and playbooks are not served (counted as hidden). Empty = serve all. */
   excludeTiers: Set<string>;
+  /**
+   * Lowercased `dev-status` values a skill must carry to be served. A skill whose `dev-status` is set
+   * to anything else is not served (counted as hidden); a skill without the field is served and
+   * counted as untracked. Empty = serve all.
+   */
+  devStatus: Set<string>;
   /** Server name reported in initialize (e.g. "bob-skills"). */
   serverName: string;
   /** Human title reported in initialize. */
@@ -119,7 +127,8 @@ usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefi
        skills-mcp pack --help        build a distributable pack (skills, playbooks, value chains) from a vault
 
   --config FILE      JSON {libraries:[{namespace,root|url,noScripts?,vault?,title?,source?,version?,metadata?}],
-                     noScripts?,lint?,playbooks?,valueChains?,excludeTiers?}; re-read on rescan/SIGHUP  env SKILLS_CONFIG
+                     noScripts?,lint?,playbooks?,valueChains?,excludeTiers?,devStatus?}; re-read on rescan/SIGHUP
+                     env SKILLS_CONFIG
   --no-scripts       withhold executable files (.sh .py .js .ps1 ...) from all manifests      env SKILLS_NO_SCRIPTS=true
   --no-lint          disable the scan-time risk linter                                        env SKILLS_LINT=false
   --root DIR|ZIP     single un-namespaced library (skill://<skill>/...)          env SKILLS_MCP_ROOT
@@ -135,6 +144,8 @@ usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefi
   --no-value-chains  never serve value chains (default: served when found)          env SKILLS_VALUE_CHAINS=false
   --exclude-tiers T1,T2  hide skills and playbooks whose pricing-tier is listed, e.g. internal,private
                      (counted as hidden; default: none)                            env SKILLS_EXCLUDE_TIERS
+  --dev-status S1,S2 serve only skills whose dev-status is listed, e.g. integrated; skills without a
+                     dev-status are served and counted as untracked (default: all) env SKILLS_DEV_STATUS
   --name NAME        MCP server name, default "skills"                           env SKILLS_NAME
   --prefix PREFIX    tool-name prefix, default = --name with '-' -> '_'          env SKILLS_TOOL_PREFIX
   --title TITLE      human title, default derived from name                     env SKILLS_TITLE
@@ -150,7 +161,7 @@ usage: skills-mcp [serve] (--root DIR | --lib NS=DIR ...) [--name NAME] [--prefi
       SKILLS_FETCH_TOKEN for private archive assets (GH_TOKEN / GITHUB_TOKEN apply to GitHub hosts only)
 `;
 
-/** Tier list from a comma string or an array, lowercased; empty entries dropped. */
+/** Tier (or dev-status) list from a comma string or an array, lowercased; empty entries dropped. */
 export function parseTiers(v: string[] | string | undefined): Set<string> {
   const list = Array.isArray(v) ? v : (v ?? "").split(",");
   return new Set(list.map((t) => String(t).trim().toLowerCase()).filter(Boolean));
@@ -247,9 +258,11 @@ export function reloadConfigFile(cfg: Config, cliLibs: Library[]): boolean {
   const playbooks = !!(fixed?.playbooks && cf.playbooks !== false);
   const valueChains = !!(fixed?.valueChains && cf.valueChains !== false);
   const tiers = cf.excludeTiers !== undefined ? parseTiers(cf.excludeTiers) : cfg.excludeTiers;
+  const devStatus = cf.devStatus !== undefined ? parseTiers(cf.devStatus) : cfg.devStatus;
+  const sameSet = (a: Set<string>, b: Set<string>) => [...a].sort().join() === [...b].sort().join();
   const changed = key(next) !== key(cfg.libraries) || noScripts !== cfg.noScripts || lint !== cfg.lint
     || playbooks !== cfg.playbooks || valueChains !== cfg.valueChains
-    || [...tiers].sort().join() !== [...cfg.excludeTiers].sort().join();
+    || !sameSet(tiers, cfg.excludeTiers) || !sameSet(devStatus, cfg.devStatus);
   cfg.libraries.splice(0, cfg.libraries.length, ...next);
   cfg.root = next[0].root;
   cfg.noScripts = noScripts;
@@ -257,6 +270,7 @@ export function reloadConfigFile(cfg: Config, cliLibs: Library[]): boolean {
   cfg.playbooks = playbooks;
   cfg.valueChains = valueChains;
   cfg.excludeTiers = tiers;
+  cfg.devStatus = devStatus;
   return changed;
 }
 
@@ -311,6 +325,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
   let playbooks = (env("PLAYBOOKS") ?? "true") !== "false";
   let valueChains = (env("VALUE_CHAINS") ?? "true") !== "false";
   let excludeTiers = parseTiers(env("EXCLUDE_TIERS"));
+  let devStatus = parseTiers(env("DEV_STATUS"));
   const vaults = new Map<string, string>();
   const parseVault = (kv: string) => { const i = kv.indexOf("="); if (i < 0) throw new Error(`--vault expects NS=DIR, got '${kv}'`); vaults.set(kv.slice(0, i).trim(), kv.slice(i + 1).trim()); };
   for (const kv of (env("VAULTS") ?? "").split(",").map((x) => x.trim()).filter(Boolean)) parseVault(kv);
@@ -336,6 +351,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     else if (a === "--no-playbooks") playbooks = false;
     else if (a === "--no-value-chains") valueChains = false;
     else if (a === "--exclude-tiers") excludeTiers = parseTiers(next());
+    else if (a === "--dev-status") devStatus = parseTiers(next());
     else if (a === "--vault") parseVault(next());
     else if (a === "--name") name = next();
     else if (a === "--prefix") prefix = next();
@@ -359,6 +375,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     if (cf.playbooks === false) playbooks = false;
     if (cf.valueChains === false) valueChains = false;
     if (cf.excludeTiers !== undefined) excludeTiers = parseTiers(cf.excludeTiers);
+    if (cf.devStatus !== undefined) devStatus = parseTiers(cf.devStatus);
   }
   for (const [ns, dir] of vaults) {
     const lib = libs.find((l) => l.namespace === ns || (ns === "" && !l.namespace));
@@ -382,6 +399,7 @@ export function loadConfig(argv: string[] = process.argv.slice(2)): Config {
     playbooks,
     valueChains,
     excludeTiers,
+    devStatus,
     serverName: name,
     title: title ?? `${name} (Agent Skills over MCP)`,
     toolPrefix: prefix,
