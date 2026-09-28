@@ -719,10 +719,10 @@ claude mcp add --scope user skills -- node /path/to/ThirdBrain-skills-mcp/dist/i
 Both filters apply to every library. A library whose skills carry no `dev-status` field is served
 in full and shows up as `untracked` in `devStatusExcluded`.
 
-This repository's `.mcp.json` does the same for one library: `node ${PWD}/dist/index.js --lib
-bob=${BOB_VAULT}`, so it works when the MCP client is started in the repository folder after
-`npm run build` with `BOB_VAULT` set to the vault root. The smoke tests read `BOB_VAULT` and
-`GBL_VAULT` the same way, and `test:startup` reads `SKILLS_CONFIG` or `BOB_VAULT`.
+This repository's `.mcp.json` serves the bundled fixture library (`test/fixtures/libA`) under the
+`demo` namespace, so it works on a fresh clone: run `npm ci && npm run build`, then start the MCP
+client in the repository folder. Point `--lib` at your own library to serve real skills. The smoke
+tests read `BOB_VAULT` and `GBL_VAULT`, and `test:startup` reads `SKILLS_CONFIG` or `BOB_VAULT`.
 
 **Serving a release pack in a new vault.** Build the pack from the live vault, then reference it
 from the new vault's `.mcp.json`:

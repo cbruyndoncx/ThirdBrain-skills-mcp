@@ -2,8 +2,7 @@
   "mcpServers": {
     "skills": {
       "command": "node",
-      "args": ["${PWD}/dist/index.js",
-               "--lib", "bob=${BOB_VAULT}"]
+      "args": ["${PWD}/dist/index.js", "--lib", "demo=${PWD}/test/fixtures/libA"]
     }
   }
 }

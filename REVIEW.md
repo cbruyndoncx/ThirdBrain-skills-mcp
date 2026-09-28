@@ -8,6 +8,13 @@ coverage and a candidate `server.json` for version 1.5.1. The original evidence 
 kept here so the changes can be audited. Public package and registry publication remain separate
 release actions.
 
+## Remediation status (updated 2026-09-28)
+
+Findings 1-15 were fixed in commits after `f25ec14` (release 1.5.1) and re-verified in code and by
+the test suite (113 unit tests, nested, eras). Follow-up items from the maintenance section are now
+done: CI workflow (Node 20/22/24, Windows, packed-tarball install check), `SECURITY.md`,
+`CONTRIBUTING.md`, and a fixture-based `.mcp.json`. Still open: publishing to npm and the registry.
+
 ## Verified checks
 
 | Check | Result |
@@ -173,7 +180,7 @@ The README's usage-first layout and explicit separation of BOB conventions are u
 
 Add a minimal fixture-based quick start so users can exercise the server without a private vault. Describe the HTTP trust model, credential scoping, cache ownership, and the difference between hiding disabled skills (still available via `skills/get`) and excluding tiers (withheld). Label runtime dependency markers and playbooks as project conventions rather than extension requirements.
 
-The repository has no CI workflow, security reporting policy, or contributor guide. These are maintenance recommendations, not official registry prerequisites. A useful release gate would run the existing fixture tests, the pinned skills scenarios, targeted regressions for the findings above, and a packaged-install check on the minimum supported Node version and a current version. Add Windows coverage if continuing to promise portable CLI behavior.
+The repository originally had no CI workflow, security reporting policy, or contributor guide (since added). These were maintenance recommendations, not official registry prerequisites. A useful release gate would run the existing fixture tests, the pinned skills scenarios, targeted regressions for the findings above, and a packaged-install check on the minimum supported Node version and a current version. Add Windows coverage if continuing to promise portable CLI behavior.
 
 This document records the original review. See the worktree diff and current test results for the
 remediation; publishing the package and registry entry remains a release action.
