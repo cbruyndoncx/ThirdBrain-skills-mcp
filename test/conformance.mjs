@@ -35,7 +35,7 @@ function suiteDir() {
   const git = (...a) => execFileSync("git", a, { cwd: dir, stdio: "ignore" });
   git("init", "-q"); git("remote", "add", "origin", SUITE_REPO);
   git("fetch", "-q", "--depth", "1", "origin", SUITE_SHA); git("checkout", "-q", "FETCH_HEAD");
-  execFileSync("npm", ["ci", "--silent"], { cwd: dir, stdio: "ignore" }); // prepare builds dist/
+  execFileSync("npm", ["ci", "--silent"], { cwd: dir, stdio: "ignore", shell: process.platform === "win32" }); // prepare builds dist/
   return dir;
 }
 

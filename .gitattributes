@@ -1,0 +1,4 @@
+# Fixtures and digests must be byte-identical on every platform (Windows CI checks out LF).
+* text=auto eol=lf
+*.png binary
+*.zip binary

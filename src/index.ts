@@ -4,7 +4,7 @@ import { toNodeHandler } from "@modelcontextprotocol/node";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { validateHostHeader, validateOriginHeader } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
-import { loadConfig, reloadConfigFile } from "./config.js";
+import { loadConfig, readConfigFile, reloadConfigFile } from "./config.js";
 import { Catalog } from "./catalog.js";
 import { createServer } from "./server.js";
 import { parsePullArgs, pull } from "./pull.js";
@@ -25,7 +25,7 @@ async function main() {
   const cfg = loadConfig(argv[0] === "serve" ? argv.slice(1) : argv);
   tag = cfg.serverName;
   // Libraries given on the CLI/env are fixed; those from --config are re-read on every rescan and on SIGHUP.
-  const fileLibs = new Set((cfg.configFile ? (await import("./config.js")).readConfigFile(cfg.configFile).libraries : []).map((l) => l.namespace));
+  const fileLibs = new Set((cfg.configFile ? readConfigFile(cfg.configFile).libraries : []).map((l) => l.namespace));
   const cliLibs = cfg.libraries.filter((l) => !fileLibs.has(l.namespace));
   const reload = async (why: string) => {
     try {
