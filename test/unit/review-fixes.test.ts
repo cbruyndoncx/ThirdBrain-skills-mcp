@@ -154,10 +154,9 @@ test("pull rejects a symlink destination and duplicate skill names", async () =>
 });
 
 test("HTTP rejects an untrusted Origin", async () => {
-  const tsx = path.resolve("node_modules/.bin/tsx");
   const entry = path.resolve("src/index.ts");
   const port = 43000 + Math.floor(Math.random() * 1000);
-  const proc = spawn(tsx, [entry, "--root", libA, "--http", String(port)], { stdio: "ignore" });
+  const proc = spawn(process.execPath, ["--import", "tsx", entry, "--root", libA, "--http", String(port)], { stdio: "ignore" });
   try {
     const url = `http://127.0.0.1:${port}/mcp`;
     let ready = false;
