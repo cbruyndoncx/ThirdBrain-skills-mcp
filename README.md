@@ -129,6 +129,13 @@ The config file adds, removes or re-points libraries while the server runs and c
 descriptive metadata (`title`, `source`, `version`) that clients see instead of paths. See
 [Runtime config file and hardening](#runtime-config-file-and-hardening).
 
+**Hosted on Render (Claude.ai custom connector).** `render.yaml` deploys the server as a Render
+Blueprint. Set `SKILLS_FETCH_TOKEN` (read-only GitHub token for the release assets) in the
+dashboard, then add `https://<service>.onrender.com/mcp/<SKILLS_PATH_KEY>` as a custom connector.
+When `SKILLS_PATH_KEY` is set (32+ characters), MCP is served only at `/mcp/<key>`; `/healthz`
+answers liveness probes. The key is a shared secret, not per-user auth: use it for a single owner
+until OAuth is in place, and rotate it if the URL leaks.
+
 ### 7. Pull skills to disk from any SEP-2640 server
 
 ```bash
@@ -197,7 +204,8 @@ there is no category tree in `skill://` URIs.
 | `--exclude-tiers T1,T2` / `SKILLS_EXCLUDE_TIERS` / `"excludeTiers"` in the config file | none | Skills and playbooks whose frontmatter `pricing-tier` is in the list (case-insensitive) are not served at all (not even to `skills/get`) and are counted in `hidden` / `playbooksHidden`; `catalog_status` and `--stats` report `tierExcluded {tiers, skills, playbooks}`. The config file value, when set, replaces the flag. |
 | `--dev-status S1,S2` / `SKILLS_DEV_STATUS` / `"devStatus"` in the config file | all | Serve only skills whose frontmatter `dev-status` is in the list (case-insensitive), e.g. `integrated`. A skill whose `dev-status` is set to anything else is not served at all (not even to `skills/get`) and is counted in `hidden`. A skill **without** a `dev-status` field is served (the library does not track it) and counted as `untracked`. `catalog_status` and `--stats` report `devStatusExcluded {statuses, skills, untracked}`. A skill withheld by both filters is counted under `tierExcluded` only. Playbooks are not affected. The config file value, when set, replaces the flag. |
 | `--http PORT` / `SKILLS_HOST` | stdio; `127.0.0.1`, port `3939` | Streamable HTTP instead of stdio; `SKILLS_HOST` sets the bind address. HTTP validates Host and Origin. |
-| `SKILLS_ALLOWED_HOSTS` | empty | Additional comma-separated hostnames accepted by HTTP. Required when `SKILLS_HOST` binds all interfaces. Place remote deployments behind authentication. |
+| `SKILLS_ALLOWED_HOSTS` | empty | Additional comma-separated hostnames accepted by HTTP. Required when `SKILLS_HOST` binds all interfaces (on Render, `RENDER_EXTERNAL_HOSTNAME` is used when unset). Place remote deployments behind authentication. |
+| `SKILLS_PATH_KEY` | empty | Secret path segment (32+ characters): HTTP serves MCP at `/mcp/<key>` instead of `/mcp`. Shared-secret stopgap, not per-user auth. |
 | `SKILLS_MAX_FILE_BYTES` | 4 MiB | Files above this are not served. |
 | `SKILLS_CACHE_DIR` | `~/.cache/skills-mcp` | Where `.zip` libraries are extracted and downloaded, keyed by content digest. |
 | `SKILLS_MAX_DOWNLOAD_BYTES` | 256 MiB | Ceiling on bytes read from the network for a remote library. |
