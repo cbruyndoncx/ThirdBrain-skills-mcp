@@ -1,0 +1,25 @@
+# Render Blueprint: deploys the skills server over Streamable HTTP for Claude.ai custom connectors.
+# Connector URL: https://<service>.onrender.com/mcp/<SKILLS_PATH_KEY>
+services:
+  - type: web
+    name: thirdbrain-skills-mcp
+    runtime: node
+    plan: starter            # free tier sleeps when idle; connectors then time out on cold start
+    region: frankfurt
+    buildCommand: npm ci     # "prepare" runs the TypeScript build
+    startCommand: node dist/index.js --http $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: SKILLS_HOST
+        value: 0.0.0.0
+      # Full library from the private release, pinned by digest. Update both id and sha256 on a new release.
+      - key: SKILLS_LIBS
+        value: bob=https://api.github.com/repos/cbruyndoncx/brncx-releases/releases/assets/634842187#sha256=509b21ccb6dab8e9f4608860474ecc66da1d6aa781c8e1de58e7425dcb26b956
+      # Secret path segment; Render generates it. Copy it from the dashboard to build the connector URL.
+      - key: SKILLS_PATH_KEY
+        generateValue: true
+      # Fine-grained GitHub token, read-only "Contents" on brncx-releases. Entered in the dashboard.
+      - key: SKILLS_FETCH_TOKEN
+        sync: false
